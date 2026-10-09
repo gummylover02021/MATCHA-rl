@@ -28,6 +28,109 @@ local function getRootPart(char)
         or char:FindFirstChild("Torso")
 end
 
+
+-- ─────────────────────────────────────────────────────────
+--  MEMORY / OFFSETS
+-- ─────────────────────────────────────────────────────────
+local Offsets = {
+    MeshPart_MeshId        = 784,
+    ParticleEmitter_Rate   = 584,
+    UnionOperation_AssetId = 784,
+    Misc_StringLength      = 16,
+    GUI_AbsSize_X          = 260,
+    GUI_AbsSize_Y          = 264,
+}
+local SPECIALMESH_MESHID_OFFSET = 248
+
+local function applyOffsets(data)
+    if not data then return false end
+    local O = data.Offsets or data.offsets
+    if not O then return false end
+    if O.MeshPart        and O.MeshPart.MeshId         then Offsets.MeshPart_MeshId        = O.MeshPart.MeshId        end
+    if O.ParticleEmitter and O.ParticleEmitter.Rate     then Offsets.ParticleEmitter_Rate   = O.ParticleEmitter.Rate   end
+    if O.UnionOperation  and O.UnionOperation.AssetId   then Offsets.UnionOperation_AssetId = O.UnionOperation.AssetId end
+    if O.Misc            and O.Misc.StringLength         then Offsets.Misc_StringLength      = O.Misc.StringLength      end
+    if O.GUI             and O.GUI.AbsSize_X             then Offsets.GUI_AbsSize_X          = O.GUI.AbsSize_X          end
+    if O.GUI             and O.GUI.AbsSize_Y             then Offsets.GUI_AbsSize_Y          = O.GUI.AbsSize_Y          end
+    return true
+end
+
+task.spawn(function()
+    local sources = {
+        "https://rbxoffsets.com/api/v1/windows/offsets/latest/json",
+        "https://raw.githubusercontent.com/yasuogoat3/y4hrware-offsets/main/FFlags.json",
+        "https://raw.githubusercontent.com/termx3/OpenMacro-XTernal/main/settings/offsets.json",
+    }
+    for _, url in next, sources do
+        local ok, result = pcall(function() return game:HttpGet(url) end)
+        if ok and result and #result > 10 then
+            local ok2, data = pcall(function() return HttpService:JSONDecode(result) end)
+            if ok2 and data and applyOffsets(data) then
+               print(string.format("[RL] offsets from %s | MeshId=%d Rate=%d GuiSizeX=%d GuiSizeY=%d",
+                url:match("([^/]+%.[^/]+)/") or url,
+                Offsets.MeshPart_MeshId, Offsets.ParticleEmitter_Rate,
+                Offsets.GUI_AbsSize_X, Offsets.GUI_AbsSize_Y))
+                return
+            end
+        end
+    end
+    warn("[RL] offset fetch failed — using hardcoded fallbacks")
+end)
+
+local function readRobloxString(addr)
+    if not addr or addr == 0 then return nil end
+    local length = memory_read("uintptr_t", addr + Offsets.Misc_StringLength)
+    if not length or length == 0 or length > 512 then return nil end
+    local dataPtr = length < 16 and addr or memory_read("uintptr_t", addr)
+    if not dataPtr or dataPtr == 0 then return nil end
+    local chars = {}
+    for i = 0, length - 1 do
+        local b = memory_read("byte", dataPtr + i)
+        if not b or (b < 32 and b ~= 0) then break end
+        chars[#chars + 1] = string.char(b)
+    end
+    return table.concat(chars)
+end
+
+local function parseAssetId(raw)
+    if not raw then return nil end
+    return raw:match("rbxassetid://(%d+)") or raw:match("^(%d+)$") or nil
+end
+
+local function readMeshId(part)
+    if not part or part.ClassName ~= "MeshPart" then return nil end
+    local base = part.Address
+    if not base or base == 0 then return nil end
+    return parseAssetId(readRobloxString(base + Offsets.MeshPart_MeshId))
+end
+
+local function readSpecialMeshId(mesh)
+    if not mesh or mesh.ClassName ~= "SpecialMesh" then return nil end
+    local base = mesh.Address
+    if not base or base == 0 then return nil end
+    return parseAssetId(readRobloxString(base + SPECIALMESH_MESHID_OFFSET))
+end
+
+local function readUnionAssetId(union)
+    if not union or union.ClassName ~= "UnionOperation" then return nil end
+    local base = union.Address
+    if not base or base == 0 then return nil end
+    local ptr = memory_read("uintptr_t", base + Offsets.UnionOperation_AssetId)
+    if not ptr or ptr == 0 then return nil end
+    return parseAssetId(readRobloxString(ptr))
+end
+
+local function readPERate(pe)
+    if not pe then return nil end
+    local base = pe.Address
+    if not base or base == 0 then return nil end
+    local rate = memory_read("float", base + Offsets.ParticleEmitter_Rate)
+    if not rate then return nil end
+    local r = math.floor(rate + 0.5)
+    if r <= 0 or r > 1000 then return nil end
+    return r
+end
+
 -- ─────────────────────────────────────────────────────────
 --  MANA OVERLAY
 -- ─────────────────────────────────────────────────────────
@@ -178,108 +281,6 @@ local function updateManaOverlay(toolName)
     else
         snapvis.Visible = false
     end
-end
-
--- ─────────────────────────────────────────────────────────
---  MEMORY / OFFSETS
--- ─────────────────────────────────────────────────────────
-local Offsets = {
-    MeshPart_MeshId        = 784,
-    ParticleEmitter_Rate   = 584,
-    UnionOperation_AssetId = 784,
-    Misc_StringLength      = 16,
-    GUI_AbsSize_X          = 260,
-    GUI_AbsSize_Y          = 264,
-}
-local SPECIALMESH_MESHID_OFFSET = 248
-
-local function applyOffsets(data)
-    if not data then return false end
-    local O = data.Offsets or data.offsets
-    if not O then return false end
-    if O.MeshPart        and O.MeshPart.MeshId         then Offsets.MeshPart_MeshId        = O.MeshPart.MeshId        end
-    if O.ParticleEmitter and O.ParticleEmitter.Rate     then Offsets.ParticleEmitter_Rate   = O.ParticleEmitter.Rate   end
-    if O.UnionOperation  and O.UnionOperation.AssetId   then Offsets.UnionOperation_AssetId = O.UnionOperation.AssetId end
-    if O.Misc            and O.Misc.StringLength         then Offsets.Misc_StringLength      = O.Misc.StringLength      end
-    if O.GUI             and O.GUI.AbsSize_X             then Offsets.GUI_AbsSize_X          = O.GUI.AbsSize_X          end
-    if O.GUI             and O.GUI.AbsSize_Y             then Offsets.GUI_AbsSize_Y          = O.GUI.AbsSize_Y          end
-    return true
-end
-
-task.spawn(function()
-    local sources = {
-        "https://rbxoffsets.com/api/v1/windows/offsets/latest/json",
-        "https://raw.githubusercontent.com/yasuogoat3/y4hrware-offsets/main/FFlags.json",
-        "https://raw.githubusercontent.com/termx3/OpenMacro-XTernal/main/settings/offsets.json",
-    }
-    for _, url in next, sources do
-        local ok, result = pcall(function() return game:HttpGet(url) end)
-        if ok and result and #result > 10 then
-            local ok2, data = pcall(function() return HttpService:JSONDecode(result) end)
-            if ok2 and data and applyOffsets(data) then
-               print(string.format("[RL] offsets from %s | MeshId=%d Rate=%d GuiSizeX=%d GuiSizeY=%d",
-                url:match("([^/]+%.[^/]+)/") or url,
-                Offsets.MeshPart_MeshId, Offsets.ParticleEmitter_Rate,
-                Offsets.GUI_AbsSize_X, Offsets.GUI_AbsSize_Y))
-                return
-            end
-        end
-    end
-    warn("[RL] offset fetch failed — using hardcoded fallbacks")
-end)
-
-local function readRobloxString(addr)
-    if not addr or addr == 0 then return nil end
-    local length = memory_read("uintptr_t", addr + Offsets.Misc_StringLength)
-    if not length or length == 0 or length > 512 then return nil end
-    local dataPtr = length < 16 and addr or memory_read("uintptr_t", addr)
-    if not dataPtr or dataPtr == 0 then return nil end
-    local chars = {}
-    for i = 0, length - 1 do
-        local b = memory_read("byte", dataPtr + i)
-        if not b or (b < 32 and b ~= 0) then break end
-        chars[#chars + 1] = string.char(b)
-    end
-    return table.concat(chars)
-end
-
-local function parseAssetId(raw)
-    if not raw then return nil end
-    return raw:match("rbxassetid://(%d+)") or raw:match("^(%d+)$") or nil
-end
-
-local function readMeshId(part)
-    if not part or part.ClassName ~= "MeshPart" then return nil end
-    local base = part.Address
-    if not base or base == 0 then return nil end
-    return parseAssetId(readRobloxString(base + Offsets.MeshPart_MeshId))
-end
-
-local function readSpecialMeshId(mesh)
-    if not mesh or mesh.ClassName ~= "SpecialMesh" then return nil end
-    local base = mesh.Address
-    if not base or base == 0 then return nil end
-    return parseAssetId(readRobloxString(base + SPECIALMESH_MESHID_OFFSET))
-end
-
-local function readUnionAssetId(union)
-    if not union or union.ClassName ~= "UnionOperation" then return nil end
-    local base = union.Address
-    if not base or base == 0 then return nil end
-    local ptr = memory_read("uintptr_t", base + Offsets.UnionOperation_AssetId)
-    if not ptr or ptr == 0 then return nil end
-    return parseAssetId(readRobloxString(ptr))
-end
-
-local function readPERate(pe)
-    if not pe then return nil end
-    local base = pe.Address
-    if not base or base == 0 then return nil end
-    local rate = memory_read("float", base + Offsets.ParticleEmitter_Rate)
-    if not rate then return nil end
-    local r = math.floor(rate + 0.5)
-    if r <= 0 or r > 1000 then return nil end
-    return r
 end
 
 -- ═════════════════════════════════════════════════════════
