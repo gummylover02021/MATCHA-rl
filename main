@@ -123,8 +123,8 @@ local GUI_ABSIZE_Y = 264
 local function readAbsoluteSize(instance)
     local base = instance.Address
     if not base or base == 0 then return nil, nil end
-    local ok1, w = pcall(memory_read, "float", base + GUI_ABSIZE_X)
-    local ok2, h = pcall(memory_read, "float", base + GUI_ABSIZE_Y)
+    local ok1, w = pcall(memory_read, "float", base + Offsets.GUI_AbsSize_X)
+    local ok2, h = pcall(memory_read, "float", base + Offsets.GUI_AbsSize_Y)
     if not ok1 or not ok2 then return nil, nil end
     return w, h
 end
@@ -188,6 +188,8 @@ local Offsets = {
     ParticleEmitter_Rate   = 584,
     UnionOperation_AssetId = 784,
     Misc_StringLength      = 16,
+    GUI_AbsSize_X          = 260,
+    GUI_AbsSize_Y          = 264,
 }
 local SPECIALMESH_MESHID_OFFSET = 248
 
@@ -199,6 +201,8 @@ local function applyOffsets(data)
     if O.ParticleEmitter and O.ParticleEmitter.Rate     then Offsets.ParticleEmitter_Rate   = O.ParticleEmitter.Rate   end
     if O.UnionOperation  and O.UnionOperation.AssetId   then Offsets.UnionOperation_AssetId = O.UnionOperation.AssetId end
     if O.Misc            and O.Misc.StringLength         then Offsets.Misc_StringLength      = O.Misc.StringLength      end
+    if O.GUI             and O.GUI.AbsSize_X             then Offsets.GUI_AbsSize_X          = O.GUI.AbsSize_X          end
+    if O.GUI             and O.GUI.AbsSize_Y             then Offsets.GUI_AbsSize_Y          = O.GUI.AbsSize_Y          end
     return true
 end
 
@@ -213,9 +217,10 @@ task.spawn(function()
         if ok and result and #result > 10 then
             local ok2, data = pcall(function() return HttpService:JSONDecode(result) end)
             if ok2 and data and applyOffsets(data) then
-                print(string.format("[RL] offsets from %s | MeshId=%d Rate=%d",
-                    url:match("([^/]+%.[^/]+)/") or url,
-                    Offsets.MeshPart_MeshId, Offsets.ParticleEmitter_Rate))
+               print(string.format("[RL] offsets from %s | MeshId=%d Rate=%d GuiSizeX=%d GuiSizeY=%d",
+                url:match("([^/]+%.[^/]+)/") or url,
+                Offsets.MeshPart_MeshId, Offsets.ParticleEmitter_Rate,
+                Offsets.GUI_AbsSize_X, Offsets.GUI_AbsSize_Y))
                 return
             end
         end
