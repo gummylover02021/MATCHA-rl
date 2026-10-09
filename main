@@ -1,0 +1,1106 @@
+--[[
+    Rogue Lineage — Matcha UI
+    Combines: Trinket ESP, Bane TP, Grapple Correction,
+              Group Detector (mod detect), Monster Spawn Tracker
+]]
+
+-- ─────────────────────────────────────────────────────────
+--  SERVICES
+-- ─────────────────────────────────────────────────────────
+local RunService  = game:GetService("RunService")
+local Players     = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local ws          = game:GetService("Workspace")
+local localPlayer = Players.LocalPlayer
+
+-- ─────────────────────────────────────────────────────────
+--  SHARED HELPERS
+-- ─────────────────────────────────────────────────────────
+local function safeRead(fn)
+    local ok, v = pcall(fn)
+    return ok and v or nil
+end
+
+local function getRootPart(char)
+    if not char then return nil end
+    return char:FindFirstChild("HumanoidRootPart")
+        or char:FindFirstChild("UpperTorso")
+        or char:FindFirstChild("Torso")
+end
+
+-- ─────────────────────────────────────────────────────────
+--  MEMORY / OFFSETS
+-- ─────────────────────────────────────────────────────────
+local Offsets = {
+    MeshPart_MeshId        = 784,
+    ParticleEmitter_Rate   = 584,
+    UnionOperation_AssetId = 784,
+    Misc_StringLength      = 16,
+}
+local SPECIALMESH_MESHID_OFFSET = 248
+
+local function applyOffsets(data)
+    if not data then return false end
+    local O = data.Offsets or data.offsets
+    if not O then return false end
+    if O.MeshPart        and O.MeshPart.MeshId         then Offsets.MeshPart_MeshId        = O.MeshPart.MeshId        end
+    if O.ParticleEmitter and O.ParticleEmitter.Rate     then Offsets.ParticleEmitter_Rate   = O.ParticleEmitter.Rate   end
+    if O.UnionOperation  and O.UnionOperation.AssetId   then Offsets.UnionOperation_AssetId = O.UnionOperation.AssetId end
+    if O.Misc            and O.Misc.StringLength         then Offsets.Misc_StringLength      = O.Misc.StringLength      end
+    return true
+end
+
+task.spawn(function()
+    local sources = {
+        "https://rbxoffsets.com/api/v1/windows/offsets/latest/json",
+        "https://raw.githubusercontent.com/yasuogoat3/y4hrware-offsets/main/FFlags.json",
+        "https://raw.githubusercontent.com/termx3/OpenMacro-XTernal/main/settings/offsets.json",
+    }
+    for _, url in next, sources do
+        local ok, result = pcall(function() return game:HttpGet(url) end)
+        if ok and result and #result > 10 then
+            local ok2, data = pcall(function() return HttpService:JSONDecode(result) end)
+            if ok2 and data and applyOffsets(data) then
+                print(string.format("[RL] offsets from %s | MeshId=%d Rate=%d",
+                    url:match("([^/]+%.[^/]+)/") or url,
+                    Offsets.MeshPart_MeshId, Offsets.ParticleEmitter_Rate))
+                return
+            end
+        end
+    end
+    warn("[RL] offset fetch failed — using hardcoded fallbacks")
+end)
+
+local function readRobloxString(addr)
+    if not addr or addr == 0 then return nil end
+    local length = memory_read("uintptr_t", addr + Offsets.Misc_StringLength)
+    if not length or length == 0 or length > 512 then return nil end
+    local dataPtr = length < 16 and addr or memory_read("uintptr_t", addr)
+    if not dataPtr or dataPtr == 0 then return nil end
+    local chars = {}
+    for i = 0, length - 1 do
+        local b = memory_read("byte", dataPtr + i)
+        if not b or (b < 32 and b ~= 0) then break end
+        chars[#chars + 1] = string.char(b)
+    end
+    return table.concat(chars)
+end
+
+local function parseAssetId(raw)
+    if not raw then return nil end
+    return raw:match("rbxassetid://(%d+)") or raw:match("^(%d+)$") or nil
+end
+
+local function readMeshId(part)
+    if not part or part.ClassName ~= "MeshPart" then return nil end
+    local base = part.Address
+    if not base or base == 0 then return nil end
+    return parseAssetId(readRobloxString(base + Offsets.MeshPart_MeshId))
+end
+
+local function readSpecialMeshId(mesh)
+    if not mesh or mesh.ClassName ~= "SpecialMesh" then return nil end
+    local base = mesh.Address
+    if not base or base == 0 then return nil end
+    return parseAssetId(readRobloxString(base + SPECIALMESH_MESHID_OFFSET))
+end
+
+local function readUnionAssetId(union)
+    if not union or union.ClassName ~= "UnionOperation" then return nil end
+    local base = union.Address
+    if not base or base == 0 then return nil end
+    local ptr = memory_read("uintptr_t", base + Offsets.UnionOperation_AssetId)
+    if not ptr or ptr == 0 then return nil end
+    return parseAssetId(readRobloxString(ptr))
+end
+
+local function readPERate(pe)
+    if not pe then return nil end
+    local base = pe.Address
+    if not base or base == 0 then return nil end
+    local rate = memory_read("float", base + Offsets.ParticleEmitter_Rate)
+    if not rate then return nil end
+    local r = math.floor(rate + 0.5)
+    if r <= 0 or r > 1000 then return nil end
+    return r
+end
+
+-- ═════════════════════════════════════════════════════════
+--  TRINKET ESP
+-- ═════════════════════════════════════════════════════════
+local trinket_colors = {
+    common   = { Color = Color3.fromRGB(200, 200, 200), ZIndex = 1 },
+    rare     = { Color = Color3.fromRGB(100, 149, 237), ZIndex = 2 },
+    mythic   = { Color = Color3.fromRGB(180,  80, 255), ZIndex = 3 },
+    artifact = { Color = Color3.fromRGB(255, 165,   0), ZIndex = 4 },
+    event    = { Color = Color3.fromRGB( 50, 205,  50), ZIndex = 5 },
+    none     = { Color = Color3.fromRGB(160, 160, 160), ZIndex = 0 },
+}
+
+local MESH_ID_MAP = {
+    ["5196782997"] = { name = "Old Ring",                 rarity = "common"   },
+    ["5196776695"] = { name = "Ring",                     rarity = "common"   },
+    ["5204003946"] = { name = "Goblet",                   rarity = "common"   },
+    ["5196577540"] = { name = "Old Amulet",               rarity = "common"   },
+    ["5196551436"] = { name = "Amulet",                   rarity = "common"   },
+    ["5204453430"] = { name = "Scroll",                   rarity = "rare"     },
+    ["5197099782"] = { name = "Amulet of the White King", rarity = "artifact" },
+    ["5196963069"] = { name = "Lannis Amulet",            rarity = "artifact" },
+    ["4103271893"] = { name = "Candy",                    rarity = "event"    },
+    ["2520762076"] = { name = "Howler Friend",            rarity = "artifact" },
+    ["2877143560"] = { name = "Gem",                      rarity = "rare"     },
+    ["4027112893"] = { name = "Bound Book",               rarity = "rare"     },
+}
+
+local rarityByColor = {}
+for k, v in next, trinket_colors do
+    rarityByColor[v.Color] = k:sub(1,1):upper() .. k:sub(2)
+end
+local function colorToRarity(c) return rarityByColor[c] end
+
+local function identify_trinket(v)
+    local cls = safeRead(function() return v.ClassName end)
+    if not cls then return nil end
+
+    if cls == "MeshPart" then
+        local mid = readMeshId(v)
+        if mid then
+            local entry = MESH_ID_MAP[mid]
+            if entry then
+                local col = trinket_colors[entry.rarity]
+                return entry.name, col.Color, col.ZIndex
+            end
+        end
+        local hasMeshChildren, meshChildCount = false, 0
+        local hasDirectPE, hasAttachment, hasWeld = false, false, false
+        for _, c in next, v:GetChildren() do
+            if c.ClassName == "MeshPart"  then meshChildCount = meshChildCount + 1; hasMeshChildren = true end
+            if c.ClassName == "ParticleEmitter" then hasDirectPE = true end
+            if c.Name      == "Attachment"      then hasAttachment = true end
+        end
+        hasWeld = v:FindFirstChildOfClass("Weld") ~= nil
+        local hasPointLight = v:FindFirstChildOfClass("PointLight") ~= nil
+        if hasMeshChildren then
+            if hasWeld and meshChildCount >= 2                      then return "Scroll",           trinket_colors.rare.Color,     trinket_colors.rare.ZIndex
+            elseif hasWeld and meshChildCount == 1 and hasPointLight then return "Lannis Amulet",   trinket_colors.artifact.Color, trinket_colors.artifact.ZIndex
+            elseif hasWeld and meshChildCount == 1                   then return "Amulet (Artifact)",trinket_colors.artifact.Color, trinket_colors.artifact.ZIndex
+            elseif meshChildCount >= 2                               then return "Amulet (Artifact)",trinket_colors.artifact.Color, trinket_colors.artifact.ZIndex
+            else                                                          return "Amulet",           trinket_colors.common.Color,   trinket_colors.common.ZIndex
+            end
+        end
+        if hasAttachment and hasDirectPE  then return "Amulet", trinket_colors.common.Color, trinket_colors.common.ZIndex end
+        if hasAttachment and not hasDirectPE then return "Scroll", trinket_colors.rare.Color, trinket_colors.rare.ZIndex end
+        return "Trinket", trinket_colors.common.Color, trinket_colors.common.ZIndex
+    end
+
+    if cls == "Part" then
+        local hasSM  = v:FindFirstChildOfClass("SpecialMesh") ~= nil
+        local hasOrb = v:FindFirstChild("OrbParticle") ~= nil
+        local hasAtt = v:FindFirstChild("Attachment") ~= nil
+        local directPE = v:FindFirstChildOfClass("ParticleEmitter")
+        if hasSM and hasOrb  then return "???",        trinket_colors.rare.Color,   trinket_colors.rare.ZIndex end
+        if hasOrb and not hasSM then return "Ice Essence", trinket_colors.rare.Color, trinket_colors.rare.ZIndex end
+        if hasSM and not hasOrb then
+            local sm   = v:FindFirstChildOfClass("SpecialMesh")
+            local smId = sm and readSpecialMeshId(sm)
+            if smId == "2877143560" then return "Gem",  trinket_colors.rare.Color, trinket_colors.rare.ZIndex
+            else                         return "Opal", trinket_colors.rare.Color, trinket_colors.rare.ZIndex end
+        end
+        if hasAtt then
+            local att = v:FindFirstChild("Attachment")
+            local pe  = att and att:FindFirstChildOfClass("ParticleEmitter")
+            if pe then
+                local rate = readPERate(pe)
+                if rate == 3 then return "Mysterious Artifact",      trinket_colors.mythic.Color,   trinket_colors.mythic.ZIndex
+                elseif rate == 5 then
+                    return (game.PlaceId == 3541987450) and "Phoenix Flower" or "Phoenix Down / Azael Horn",
+                           trinket_colors.artifact.Color, trinket_colors.artifact.ZIndex
+                end
+            end
+            if att and att:FindFirstChild("swirl") then return "Idol of War", trinket_colors.common.Color, trinket_colors.common.ZIndex end
+        end
+        if directPE and not hasSM then return "Rift Gem", trinket_colors.mythic.Color, trinket_colors.mythic.ZIndex end
+    end
+
+    if cls == "UnionOperation" then
+        local aid = readUnionAssetId(v)
+        return "Idol", trinket_colors.common.Color, trinket_colors.common.ZIndex
+    end
+    return nil
+end
+
+local trinket_esp_objects = {}
+
+local function detectTrinketArea(trinket)
+    local areaMarkers = ws:FindFirstChild("AreaMarkers")
+    if not areaMarkers then return "None" end
+    local pos = safeRead(function() return trinket.Position end)
+    if not pos then return "None" end
+    local best, bestD = "None", math.huge
+    for _, m in next, areaMarkers:GetChildren() do
+        local mp = safeRead(function() return m.Position end)
+        if mp then local d = (pos - mp).Magnitude; if d < bestD then best = m.Name; bestD = d end end
+    end
+    return best
+end
+
+local function add_trinket_esp(trinket, name, color, zindex)
+    local zi = zindex or 10
+    local dot = Drawing.new("Circle"); dot.Radius=4; dot.NumSides=12; dot.Filled=true; dot.Color=color; dot.ZIndex=zi; dot.Visible=false
+    local dotO = Drawing.new("Circle"); dotO.Radius=5; dotO.NumSides=12; dotO.Filled=false; dotO.Thickness=1; dotO.Color=Color3.fromRGB(0,0,0); dotO.ZIndex=zi-1; dotO.Visible=false
+    local line = Drawing.new("Line"); line.Thickness=1; line.Color=color; line.ZIndex=zi; line.Visible=false
+    local lbl = Drawing.new("Text"); lbl.Center=true; lbl.Outline=true; lbl.Font=Drawing.Fonts.SystemBold; lbl.Size=13; lbl.Color=color; lbl.ZIndex=zi+1; lbl.Visible=false
+
+    local esp = { object=trinket, name=name, color=color, area=detectTrinketArea(trinket), disabled=false, lastText="", lastTextTime=0, dot=dot, dotOutline=dotO, line=line, label=lbl }
+
+    function esp:hide()
+        self.dot.Visible=false; self.dotOutline.Visible=false; self.line.Visible=false; self.label.Visible=false; self.disabled=true
+    end
+    function esp:destruct()
+        self.dot:Remove(); self.dotOutline:Remove(); self.line:Remove(); self.label:Remove()
+        trinket_esp_objects[self.object.Address]=nil; trinket_esp_objects[self.object]=nil
+    end
+    function esp:update(toggled, range, showArea)
+        if not toggled then if not self.disabled then self:hide() end return end
+        local rarity  = colorToRarity(self.color)
+        self.disabled = false
+        if safeRead(function() return self.object.Parent end) == nil then self:destruct() return end
+        local pos = safeRead(function() return self.object.CFrame.Position end)
+        if not pos then self:hide() return end
+        local cam = ws.CurrentCamera
+        if not cam then self:hide() return end
+        local dist = (cam.CFrame.Position - pos).Magnitude
+        if dist >= range then self:hide() return end
+        local sp, on = WorldToScreen(pos)
+        if not on then self:hide() return end
+        local now = os.clock()
+        if now - self.lastTextTime >= 0.2 then
+            local aStr = (showArea and self.area ~= "None") and "\n("..self.area..")" or ""
+            self.lastText = self.name.."\n"..math.floor(dist).."m"..aStr
+            self.lastTextTime = now
+        end
+        local dp = Vector2.new(sp.X, sp.Y)
+        local lp = Vector2.new(sp.X, sp.Y - 28)
+        self.dot.Position=dp; self.dot.Visible=true
+        self.dotOutline.Position=dp; self.dotOutline.Visible=true
+        self.line.From=dp; self.line.To=lp; self.line.Visible=true
+        self.label.Text=self.lastText; self.label.Position=lp; self.label.Visible=true
+    end
+
+    trinket_esp_objects[trinket.Address] = esp
+    trinket_esp_objects[trinket]          = esp
+    return esp
+end
+
+local TRINKET_SCAN_INTERVAL = 2
+task.spawn(function()
+    while true do
+        task.wait(TRINKET_SCAN_INTERVAL)
+        if UI.GetValue("trinket_esp") then
+            local char = localPlayer and localPlayer.Character
+            local root = char and getRootPart(char)
+            if root then
+                local rootPos = root.Position
+                local range   = UI.GetValue("trinket_range") or 75
+                pcall(function()
+                    for _, v in next, ws:GetChildren() do
+                        if (v:IsA("BasePart") or v:IsA("UnionOperation"))
+                        and v.Name == "Part"
+                        and v:FindFirstChild("ID")
+                        and not trinket_esp_objects[v.Address]
+                        and (v.Position - rootPos).Magnitude <= range + 20 then
+                            local name, color, zindex = identify_trinket(v)
+                            if name then
+                                print("[TrinketESP] found: " .. name)
+                                add_trinket_esp(v, name, color, zindex)
+                            end
+                        end
+                    end
+                end)
+            end
+        end
+    end
+end)
+
+
+
+-- ═════════════════════════════════════════════════════════
+--  BANE TP
+-- ═════════════════════════════════════════════════════════
+local STAND_OFFSET = 2
+local LERP_SPEED   = 14
+local DONE_DIST    = 0.8
+local interpActive = false
+local interpTimer  = 0
+local interpGoal   = nil
+local interpName   = "?"
+local wasAttacking = false
+
+local function hasBaneEff()
+    local char = localPlayer and localPlayer.Character
+    if not char then return false end
+    for _, v in next, char:GetChildren() do
+        if v.ClassName == "Accessory" and v.Name == "BaneEff" then return true end
+    end
+    return false
+end
+
+local function isAttacking()
+    local char = localPlayer and localPlayer.Character
+    if not char then return false end
+    for _, v in next, char:GetChildren() do
+        if v.ClassName == "Accessory" and v.Name == "LightAttack" then return true end
+    end
+    return false
+end
+
+local function isRagdolled()
+    if not localPlayer then return false end
+    local char = localPlayer.Character
+    if not char then return false end
+    local ok, result = pcall(function() return char:FindFirstChild("Stun") ~= nil end)
+    return ok and result or false
+end
+
+local function getLocalRootPart()
+    local char = localPlayer and localPlayer.Character
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getPlayerCharSet()
+    local set = {}
+    for _, p in next, Players:GetPlayers() do
+        local c = safeRead(function() return p.Character end)
+        if c then set[c] = true end
+    end
+    return set
+end
+
+local function getRootModelHRP(instance, myChar)
+    if not instance then return nil end
+    local obj = instance
+    while obj and obj.Parent ~= ws do obj = obj.Parent end
+    if not obj or obj == myChar then return nil end
+    local hrp = safeRead(function() return obj:FindFirstChild("HumanoidRootPart") end)
+    local hum = safeRead(function() return obj:FindFirstChildOfClass("Humanoid") end)
+    return (hrp and hum) and hrp or nil
+end
+
+local function getLookedAtHRP(myChar, radius)
+    local cam = ws.CurrentCamera
+    if not cam then return nil end
+    local result = safeRead(function() return ws:Raycast(cam.CFrame.Position, cam.CFrame.LookVector * radius) end)
+    return result and getRootModelHRP(result.Instance, myChar) or nil
+end
+
+local function findNearestHRP(myChar, myPos, charSet, radius)
+    local bestDist, bestHRP = radius, nil
+    for _, p in next, Players:GetPlayers() do
+        if p == localPlayer then continue end
+        local char = safeRead(function() return p.Character end)
+        if not char then continue end
+        local hrp = safeRead(function() return char:FindFirstChild("HumanoidRootPart") end)
+        if not hrp then continue end
+        local d = (hrp.Position - myPos).Magnitude
+        if d < bestDist then bestDist = d; bestHRP = hrp end
+    end
+    for _, obj in next, ws:GetChildren() do
+        if charSet[obj] or obj == myChar then continue end
+        local ok, children = pcall(function() return obj:GetChildren() end)
+        if not ok then continue end
+        local hrp, hasHum = nil, false
+        for _, child in next, children do
+            local cn = safeRead(function() return child.ClassName end)
+            if cn == "Humanoid"         then hasHum = true end
+            if cn == "HumanoidRootPart" then hrp = child   end
+        end
+        if hasHum and hrp then
+            local d = (hrp.Position - myPos).Magnitude
+            if d < bestDist then bestDist = d; bestHRP = hrp end
+        end
+    end
+    return bestHRP
+end
+
+local function buildGoalCFrame(hrp, myRoot)
+    local myPos, targetPos = myRoot.Position, hrp.Position
+    local toMe = myPos - targetPos
+    local mag  = toMe.Magnitude
+    local dir  = mag > 0.01 and toMe.Unit or Vector3.new(0,0,1)
+    local landPos = targetPos + dir * STAND_OFFSET
+    local fwd = targetPos - landPos
+    local fwdM = fwd.Magnitude
+    fwd = fwdM > 0.01 and fwd.Unit or Vector3.new(0,0,-1)
+    local worldUp = Vector3.new(0,1,0)
+    local right = fwd:Cross(worldUp)
+    local rightM = right.Magnitude
+    right = rightM > 0.01 and right.Unit or Vector3.new(1,0,0)
+    local up = right:Cross(fwd)
+    return CFrame.new(landPos.X,landPos.Y,landPos.Z, right.X,right.Y,right.Z, up.X,up.Y,up.Z, -fwd.X,-fwd.Y,-fwd.Z)
+end
+
+-- ═════════════════════════════════════════════════════════
+--  GRAPPLE CORRECTION
+-- ═════════════════════════════════════════════════════════
+local grappleActive   = false
+local grappleTarget   = nil
+local grappleVelocity = nil
+local CORRECTION_STRENGTH = 0.75
+local MAX_Y_DELTA         = 80
+
+local function findGrappleTarget()
+    for _, p in next, Players:GetPlayers() do
+        if p == localPlayer then continue end
+        local char = p.Character
+        if char and char:FindFirstChild("GrapplePulled") then return char end
+    end
+    return nil
+end
+
+local function onGrappleStart(bv)
+    grappleActive = true; grappleVelocity = bv; grappleTarget = findGrappleTarget()
+end
+local function onGrappleEnd()
+    grappleActive = false; grappleVelocity = nil; grappleTarget = nil
+end
+
+-- Descendant watcher for grapple detection
+local localSnapshot     = {}
+local nearestSnapshot   = {}
+local lastNearestPlayer = nil
+local lastNearestChar   = nil
+local localChar_last    = nil
+
+local function buildSnapshot(model)
+    local snap = {}
+    local ok, descendants = pcall(function() return model:GetDescendants() end)
+    if ok and descendants then
+        for _, d in next, descendants do
+            local ok2, addr = pcall(function() return d.Address end)
+            if ok2 and addr then snap[addr] = true end
+        end
+    end
+    return snap
+end
+
+local function diffAndDetect(model, snapshot, label)
+    local ok, descendants = pcall(function() return model:GetDescendants() end)
+    if not ok or not descendants then return end
+    for _, d in next, descendants do
+        local ok2, addr = pcall(function() return d.Address end)
+        if not ok2 or not addr then continue end
+        if not snapshot[addr] then
+            snapshot[addr] = true
+            if label == "LOCAL" then
+                local ok3, name = pcall(function() return d.Name end)
+                local ok4, cls  = pcall(function() return d.ClassName end)
+                if ok3 and ok4 and name == "GrappleVelocity" and cls == "BodyVelocity" then
+                    onGrappleStart(d)
+                end
+            end
+        end
+    end
+end
+
+local function getNearestChar()
+    local localChar = localPlayer.Character
+    local localRoot = getRootPart(localChar)
+    if not localRoot then return nil, nil end
+    local nearestPlayer, nearestDist = nil, math.huge
+    for _, p in next, Players:GetPlayers() do
+        if p == localPlayer then continue end
+        local char = p.Character
+        local root = getRootPart(char)
+        if root then
+            local dist = (root.Position - localRoot.Position).Magnitude
+            if dist < nearestDist then nearestDist = dist; nearestPlayer = p end
+        end
+    end
+    if nearestPlayer then return nearestPlayer, nearestPlayer.Character end
+    return nil, nil
+end
+
+local initChar = localPlayer.Character
+if initChar then localChar_last = initChar; localSnapshot = buildSnapshot(initChar) end
+local initNearest, initNearestChar = getNearestChar()
+if initNearest and initNearestChar then
+    lastNearestPlayer = initNearest; lastNearestChar = initNearestChar
+    nearestSnapshot = buildSnapshot(initNearestChar)
+end
+
+local NEAREST_INTERVAL = 2
+local lastNearestCheck = 0
+
+-- ═════════════════════════════════════════════════════════
+--  GROUP DETECTOR
+-- ═════════════════════════════════════════════════════════
+local GROUP_ID              = 4556484
+local groupMembersInServer  = {}
+local trackedPlayers        = {}
+local currentPlayers        = {}
+local notifications         = {}
+
+local NOTIF_WIDTH   = 320
+local NOTIF_HEIGHT  = 60
+local NOTIF_X       = 20
+local NOTIF_Y       = 80
+local NOTIF_GAP     = 8
+local OFFSCREEN_X   = -NOTIF_WIDTH - 20
+local DEFAULT_DUR   = 5
+local EXISTING_DUR  = 12
+
+local drawingMeta = {}
+local function setMeta(d, ox) drawingMeta[d] = { offsetX = ox } end
+local function getOffsetX(d) local m = drawingMeta[d]; return m and m.offsetX or 0 end
+local function cleanMeta(d) drawingMeta[d] = nil end
+
+local function tweenDrawingsX(notif, fromX, toX, dur, onComplete)
+    local startTime = tick()
+    local con
+    con = RunService.Heartbeat:Connect(function()
+        local t = math.min((tick() - startTime) / dur, 1)
+        local eased = 1 - (1 - t)^3
+        local cx = fromX + (toX - fromX) * eased
+        for _, d in ipairs(notif.drawings) do
+            local ox = getOffsetX(d)
+            pcall(function() d.Position = Vector2.new(cx + ox, d.Position.Y) end)
+        end
+        if t >= 1 then con:Disconnect(); if onComplete then onComplete() end end
+    end)
+    return con
+end
+
+local function repositionNotifications()
+    local y = NOTIF_Y
+    for _, notif in ipairs(notifications) do
+        local bg, accent, title, body = notif.drawings[1], notif.drawings[2], notif.drawings[3], notif.drawings[4]
+        bg.Position    = Vector2.new(bg.Position.X,    y)
+        accent.Position= Vector2.new(accent.Position.X,y)
+        title.Position = Vector2.new(title.Position.X, y + 10)
+        body.Position  = Vector2.new(body.Position.X,  y + 32)
+        y = y + NOTIF_HEIGHT + NOTIF_GAP
+    end
+end
+
+local function createNotification(title, body, color, duration)
+    if not UI.GetValue("group_detector") then return end
+    local notif = { title=title, body=body, color=color or Color3.fromRGB(60,120,255),
+                    createdAt=tick(), duration=duration or DEFAULT_DUR, drawings={}, tweening=true, removing=false }
+    local startY = NOTIF_Y
+
+    local bg = Drawing.new("Square")
+    bg.Size=Vector2.new(NOTIF_WIDTH,NOTIF_HEIGHT); bg.Position=Vector2.new(OFFSCREEN_X,startY)
+    bg.Color=Color3.fromRGB(20,20,28); bg.Filled=true; bg.Transparency=1; bg.Visible=true; bg.ZIndex=10; bg.Corner=8
+    setMeta(bg, 0)
+
+    local accent = Drawing.new("Square")
+    accent.Size=Vector2.new(4,NOTIF_HEIGHT); accent.Position=Vector2.new(OFFSCREEN_X,startY)
+    accent.Color=notif.color; accent.Filled=true; accent.Transparency=1; accent.Visible=true; accent.ZIndex=11
+    setMeta(accent, 0)
+
+    local titleText = Drawing.new("Text")
+    titleText.Text=title; titleText.Position=Vector2.new(OFFSCREEN_X+14,startY+10)
+    titleText.Color=notif.color; titleText.Size=16; titleText.Font=Drawing.Fonts.SystemBold
+    titleText.Outline=true; titleText.Visible=true; titleText.ZIndex=12
+    setMeta(titleText, 14)
+
+    local bodyText = Drawing.new("Text")
+    bodyText.Text=body; bodyText.Position=Vector2.new(OFFSCREEN_X+14,startY+32)
+    bodyText.Color=Color3.fromRGB(210,210,220); bodyText.Size=13; bodyText.Font=Drawing.Fonts.System
+    bodyText.Outline=true; bodyText.Visible=true; bodyText.ZIndex=12
+    setMeta(bodyText, 14)
+
+    notif.drawings = { bg, accent, titleText, bodyText }
+    table.insert(notifications, notif)
+    repositionNotifications()
+    tweenDrawingsX(notif, OFFSCREEN_X, NOTIF_X, 0.35, function() notif.tweening = false end)
+    return notif
+end
+
+local function removeNotification(notif, onDone)
+    if notif.removing then return end
+    notif.removing = true
+    tweenDrawingsX(notif, NOTIF_X, OFFSCREEN_X, 0.3, function()
+        for _, d in ipairs(notif.drawings) do cleanMeta(d); d:Remove() end
+        if onDone then onDone() end
+    end)
+end
+
+local function isInGroup(player)
+    local url = string.format("https://groups.roblox.com/v2/users/%d/groups/roles", player.UserId)
+    local body = httpget(url)
+    if body == "" then return false end
+    local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+    if not ok or not data or not data.data then return false end
+    for _, entry in ipairs(data.data) do
+        if entry.group and entry.group.id == GROUP_ID then
+            return true, entry.role and entry.role.name or "Unknown Rank"
+        end
+    end
+    return false
+end
+
+local function onPlayerJoined(player, isExisting)
+    task.spawn(function()
+        local inGroup, rank = isInGroup(player)
+        if inGroup then
+            groupMembersInServer[player.UserId] = { name=player.Name, rank=rank }
+            if isExisting then
+                createNotification("Group Member In Server", player.Name.." | "..(rank or "N/A"), Color3.fromRGB(255,180,0), EXISTING_DUR)
+            else
+                createNotification("Group Member Joined", player.Name.." | "..(rank or "N/A"), Color3.fromRGB(80,220,120))
+            end
+            repositionNotifications()
+        end
+        trackedPlayers[player.UserId] = true
+    end)
+end
+
+local function onPlayerLeft(userId, data)
+    createNotification("Group Member Left", data.name.." | "..(data.rank or "N/A"), Color3.fromRGB(220,80,80))
+    groupMembersInServer[userId] = nil
+    repositionNotifications()
+end
+
+local existing = Players:GetPlayers()
+for _, player in ipairs(existing) do
+    currentPlayers[player.UserId] = player
+    onPlayerJoined(player, true)
+end
+
+-- ═════════════════════════════════════════════════════════
+--  MONSTER SPAWN TRACKER
+-- ═════════════════════════════════════════════════════════
+local spawnTrackerEnabled = false
+local spawnPanel, spawnBorder, spawnHeader, spawnDivider = nil, nil, nil, nil
+local spawnRowLabels = {}
+local spawnLocations = nil
+local spawnLastUpdate = 0
+
+local function buildSpawnTracker()
+    local ok = pcall(function()
+        local triggers = ws.MonsterSpawns.Triggers
+        spawnLocations = {
+            { name = "Crypt",          value = triggers.CryptTrigger.LastSpawned    },
+            { name = "Castle Rock",    value = triggers.CastleRockSnake.LastSpawned },
+            { name = "Snake Pit",      value = triggers.MazeSnakes.LastSpawned      },
+            { name = "Sunken Passage", value = triggers.evileye1.LastSpawned        },
+        }
+    end)
+    if not ok then warn("[SpawnTracker] MonsterSpawns not found"); return false end
+
+    local C_BG    = Color3.fromRGB(10, 11, 14)
+    local C_BDR   = Color3.fromRGB(50, 55, 72)
+    local C_HEAD  = Color3.fromRGB(158,158,232)
+    local ROW_H   = 20
+    local PAD     = 10
+    local WIDTH   = 230
+    local HEIGHT  = PAD*2 + 16 + 4 + (#spawnLocations * ROW_H) + PAD
+    local PX, PY  = 20, 20
+
+    spawnPanel = Drawing.new("Square"); spawnPanel.Filled=true; spawnPanel.Color=C_BG; spawnPanel.ZIndex=0; spawnPanel.Corner=6
+    spawnPanel.Position=Vector2.new(PX,PY); spawnPanel.Size=Vector2.new(WIDTH,HEIGHT); spawnPanel.Visible=false
+
+    spawnBorder = Drawing.new("Square"); spawnBorder.Filled=false; spawnBorder.Color=C_BDR; spawnBorder.ZIndex=1; spawnBorder.Corner=6; spawnBorder.Thickness=1
+    spawnBorder.Position=Vector2.new(PX,PY); spawnBorder.Size=Vector2.new(WIDTH,HEIGHT); spawnBorder.Visible=false
+
+    spawnHeader = Drawing.new("Text"); spawnHeader.Text="Monster Spawn Tracker"; spawnHeader.Size=13
+    spawnHeader.Font=Drawing.Fonts.SystemBold; spawnHeader.Color=C_HEAD; spawnHeader.Center=true
+    spawnHeader.Outline=true; spawnHeader.ZIndex=2; spawnHeader.Visible=false
+    spawnHeader.Position=Vector2.new(PX + WIDTH/2, PY + PAD)
+
+    local divY = PY + PAD + 16 + 2
+    spawnDivider = Drawing.new("Line"); spawnDivider.Color=C_BDR; spawnDivider.Thickness=1; spawnDivider.ZIndex=2; spawnDivider.Visible=false
+    spawnDivider.From=Vector2.new(PX+PAD, divY); spawnDivider.To=Vector2.new(PX+WIDTH-PAD, divY)
+
+    spawnRowLabels = {}
+    for i = 1, #spawnLocations do
+        local rowY = divY + 4 + (i-1)*ROW_H + (ROW_H-13)/2
+        local lbl = Drawing.new("Text"); lbl.Text=spawnLocations[i].name.." - ..."
+        lbl.Size=12; lbl.Font=Drawing.Fonts.SystemBold; lbl.Color=Color3.fromRGB(120,125,145)
+        lbl.Outline=true; lbl.ZIndex=3; lbl.Visible=false
+        lbl.Position=Vector2.new(PX+PAD, rowY)
+        spawnRowLabels[i] = lbl
+    end
+    return true
+end
+
+local function setSpawnVisible(v)
+    if spawnPanel  then spawnPanel.Visible=v  end
+    if spawnBorder then spawnBorder.Visible=v end
+    if spawnHeader then spawnHeader.Visible=v end
+    if spawnDivider then spawnDivider.Visible=v end
+    for _, l in next, spawnRowLabels do l.Visible=v end
+end
+
+local function formatSpawnTime(diff)
+    local days    = math.floor(diff/86400)
+    local hours   = math.floor((diff%86400)/3600)
+    local minutes = math.floor((diff%3600)/60)
+    local secs    = math.floor(diff%60)
+    local parts   = {}
+    if days    > 0 then table.insert(parts, days.."d")    end
+    if hours   > 0 then table.insert(parts, hours.."h")   end
+    if minutes > 0 then table.insert(parts, minutes.."m") end
+    if days==0 and hours==0 and minutes==0 and secs>0 then table.insert(parts, secs.."s") end
+    return #parts == 0 and "just now" or table.concat(parts, " ")
+end
+
+local function updateSpawnLabels()
+    if not spawnLocations then return end
+    local now = os.time()
+    for i, loc in next, spawnLocations do
+        local lbl = spawnRowLabels[i]
+        if not lbl then continue end
+        local ok, raw = pcall(function() return loc.value.Value end)
+        if not ok or not raw then
+            lbl.Text=loc.name.." - unknown"; lbl.Color=Color3.fromRGB(120,125,145)
+        elseif raw == 0 then
+            lbl.Text=loc.name.." - never"; lbl.Color=Color3.fromRGB(120,125,145)
+        else
+            local diff = math.max(0, now - raw)
+            local ago  = formatSpawnTime(diff)
+            lbl.Text  = loc.name.." - "..ago.." ago"
+            lbl.Color = diff < 300 and Color3.fromRGB(220,140,145)
+                     or diff < 1800 and Color3.fromRGB(238,185,128)
+                     or Color3.fromRGB(228,230,240)
+        end
+    end
+end
+
+-- ═════════════════════════════════════════════════════════
+--  ILLUSIONIST DETECTOR
+-- ═════════════════════════════════════════════════════════
+local illusionistList = {}  -- userId -> { name, hasObserve }
+
+local function checkIllusionist(player)
+    local ok, userId = pcall(function() return player.UserId end)
+    if not ok or not userId then return end
+    if illusionistList[userId] then return end  -- already tracked
+
+    local ok2, name = pcall(function() return player.Name end)
+    if not ok2 or not name then return end
+
+    -- Check backpack for Observe tool
+    local backpack = safeRead(function() return player:FindFirstChildOfClass("Backpack") end)
+    if not backpack then return end
+
+    local hasObserve = safeRead(function()
+        return backpack:FindFirstChild("Observe") ~= nil
+    end)
+
+    if hasObserve then
+if not UI.GetValue("illusionist_detector") then return end
+        illusionistList[userId] = { name = name, alerted = false }
+        createNotification(
+            "Illusionist Detected",
+            name .. " has Observe",
+            Color3.fromRGB(180, 80, 255),
+            EXISTING_DUR
+        )
+        print(string.format("[Illusionist] DETECTED: %s has Observe in backpack", name))
+    end
+end
+
+local function watchIllusionist(player)
+    local ok, userId = pcall(function() return player.UserId end)
+    if not ok or not userId then return end
+    local ok2, name = pcall(function() return player.Name end)
+    if not ok2 or not name then return end
+
+    task.spawn(function()
+        -- Wait a moment for backpack to populate
+        task.wait(2)
+        checkIllusionist(player)
+
+        -- Watch their character for Observe being equipped
+        while true do
+            task.wait(0.5)
+
+            -- Stop watching if player left
+            local stillHere = false
+            for _, p in next, Players:GetPlayers() do
+                local pid = safeRead(function() return p.UserId end)
+                if pid == userId then stillHere = true; break end
+            end
+            if not stillHere then
+                illusionistList[userId] = nil
+                break
+            end
+
+            local char = safeRead(function() return player.Character end)
+            if not char then continue end
+
+            -- Check if Observe is equipped (in character, not backpack)
+            local equipped = safeRead(function()
+                return char:FindFirstChild("Observe") ~= nil
+            end)
+
+            local entry = illusionistList[userId]
+            if equipped and entry and not entry.alerted then
+                entry.alerted = true
+                createNotification(
+                    "Observe Equipped!",
+                    name .. " equipped Observe",
+                    Color3.fromRGB(255, 60, 60),
+                    DEFAULT_DUR
+                )
+                print(string.format("[Illusionist] EQUIPPED: %s equipped Observe", name))
+            elseif not equipped and entry and entry.alerted then
+                -- Reset so we alert again next time they equip
+                entry.alerted = false
+            end
+        end
+    end)
+end
+
+-- Scan players already in server at startup
+for _, player in next, Players:GetPlayers() do
+    local pid = safeRead(function() return player.UserId end)
+    if pid and pid ~= localPlayer.UserId then
+        watchIllusionist(player)
+    end
+end
+
+
+    if UI.GetValue("illusionist_detector") then
+        for _, player in ipairs(Players:GetPlayers()) do
+            local pid = safeRead(function() return player.UserId end)
+            if pid and pid ~= localPlayer.UserId and not illusionistList[pid] then
+                -- mark as pending so we don't spawn twice
+                illusionistList[pid] = { name = safeRead(function() return player.Name end) or "?", alerted = false, pending = true }
+                watchIllusionist(player)
+            end
+        end
+    end
+
+-- ═════════════════════════════════════════════════════════
+--  MATCHA UI TAB
+-- ═════════════════════════════════════════════════════════
+UI.AddTab("Rogue Lineage", function(tab)
+
+    -- ── LEFT: Trinket ESP + Bane + Grapple ───────────────
+    local combat = tab:Section("Combat & Detection", "Left")
+
+    -- Trinket ESP
+    combat:Toggle("trinket_esp", "Trinket ESP", false)
+    combat:Keybind("trinket_esp_kb", 0, "toggle")
+    combat:Toggle("trinket_show_area", "Show Area", false)
+    combat:SliderInt("trinket_range", "Trinket Range", 20, 500, 75, function(v)
+        -- range applied live in scan loop
+    end)
+    combat:Spacing()
+
+    -- Bane TP
+    combat:Toggle("bane_tp", "Bane TP", false)
+    combat:Keybind("bane_tp_kb", 0, "toggle")
+    combat:SliderInt("bane_radius", "Bane Radius", 1, 30, 15, function(v)
+        -- applied in bane logic
+    end)
+    combat:Spacing()
+
+    -- Grapple Correction
+    combat:Toggle("grapple_correction", "Grapple Correction", false)
+    combat:Keybind("grapple_kb", 0, "toggle")
+    combat:SliderFloat("grapple_strength", "Correction Strength", 0.1, 1.0, 0.75, "%.2f", function(v)
+        CORRECTION_STRENGTH = v
+    end)
+
+    -- ── RIGHT: Group Detector + Spawn Tracker ────────────
+    local utility = tab:Section("Utility", "Right")
+
+    -- Group Detector
+    utility:Toggle("group_detector", "Group Detector", false)
+    utility:Keybind("group_detector_kb", 0, "toggle")
+    utility:Text("Group ID: " .. GROUP_ID)
+    utility:Spacing()
+
+    -- Illusionist Detector
+    utility:Spacing()
+    utility:Toggle("illusionist_detector", "Illusionist Detector", true)
+    utility:Keybind("illusionist_detector_kb", 0, "toggle")
+
+    -- Monster Spawn Tracker
+    utility:Toggle("spawn_tracker", "Spawn Tracker", false, function(state)
+        spawnTrackerEnabled = state
+        if state and not spawnLocations then
+            buildSpawnTracker()
+        end
+        setSpawnVisible(state)
+    end)
+    utility:Keybind("spawn_tracker_kb", 0, "toggle")
+end)
+
+-- ═════════════════════════════════════════════════════════
+--  MAIN LOOPS
+-- ═════════════════════════════════════════════════════════
+RunService.RenderStepped:Connect(function(dt)
+    -- ── Trinket ESP updates ──────────────────────────────
+    local trinketOn  = UI.GetValue("trinket_esp")
+    local trinketRng = UI.GetValue("trinket_range") or 75
+    local showArea   = UI.GetValue("trinket_show_area")
+    for _, esp in next, trinket_esp_objects do
+        if type(esp) == "table" and esp.update then
+            pcall(function() esp:update(trinketOn, trinketRng, showArea) end)
+        end
+    end
+
+    -- ── Bane TP ──────────────────────────────────────────
+    if UI.GetValue("bane_tp") then
+        local baneRadius = UI.GetValue("bane_radius") or 15
+        local attackNow  = isAttacking()
+        if attackNow and not wasAttacking and not interpActive and hasBaneEff() then
+            local myRoot = getLocalRootPart()
+            if myRoot then
+                local myChar  = myRoot.Parent
+                local myPos   = myRoot.Position
+                local charSet = getPlayerCharSet()
+                local target  = getLookedAtHRP(myChar, baneRadius)
+                if target and (target.Position - myPos).Magnitude > baneRadius then target = nil end
+                target = target or findNearestHRP(myChar, myPos, charSet, baneRadius)
+                if target then
+                    local ok, cf = pcall(buildGoalCFrame, target, myRoot)
+                    if ok and cf then
+                        interpGoal = cf; interpActive = true; interpTimer = 0
+                        interpName = safeRead(function() return target.Parent.Name end) or "?"
+                    end
+                end
+            end
+        end
+        wasAttacking = attackNow
+
+        if interpActive and interpGoal then
+            interpTimer = interpTimer + dt
+            if interpTimer > 0.2 or isRagdolled() then
+                interpActive = false; interpGoal = nil; interpTimer = 0
+            else
+                local myRoot = getLocalRootPart()
+                if myRoot then
+                    local current = myRoot.CFrame
+                    local dist    = (current.Position - interpGoal.Position).Magnitude
+                    if dist < DONE_DIST then
+                        pcall(function() myRoot.CFrame = interpGoal; myRoot.AssemblyLinearVelocity=Vector3.zero; myRoot.AssemblyAngularVelocity=Vector3.zero end)
+                        interpActive = false; interpGoal = nil; interpTimer = 0
+                    else
+                        local speedScale = math.clamp(dist/5, 0.4, 1)
+                        local alpha      = math.clamp(LERP_SPEED * speedScale * dt, 0, 1)
+                        pcall(function() myRoot.CFrame = current:Lerp(interpGoal, alpha); myRoot.AssemblyLinearVelocity = myRoot.AssemblyLinearVelocity * 0.3 end)
+                    end
+                else
+                    interpActive = false; interpGoal = nil; interpTimer = 0
+                end
+            end
+        end
+    else
+        wasAttacking = false
+        if interpActive then interpActive=false; interpGoal=nil; interpTimer=0 end
+    end
+
+    -- ── Grapple correction ───────────────────────────────
+    if UI.GetValue("grapple_correction") and grappleActive then
+        if not grappleTarget then grappleTarget = findGrappleTarget() end
+        if grappleTarget then
+            local localChar = localPlayer.Character
+            if not localChar then onGrappleEnd()
+            else
+                local hrp = localChar:FindFirstChild("HumanoidRootPart")
+                if not hrp then onGrappleEnd()
+                else
+                    local bv = hrp:FindFirstChild("GrappleVelocity")
+                    if not bv then onGrappleEnd()
+                    else
+                        local targetRoot = getRootPart(grappleTarget)
+                        if targetRoot then
+                            local myPos, targetPos = hrp.Position, targetRoot.Position
+                            local yDelta = targetPos.Y - myPos.Y
+                            if math.abs(yDelta) <= MAX_Y_DELTA then
+                                local ok, curVel = pcall(function() return bv.Velocity end)
+                                if ok and curVel then
+                                    local hDist  = Vector3.new(targetPos.X-myPos.X, 0, targetPos.Z-myPos.Z).Magnitude
+                                    local hSpeed = math.sqrt(curVel.X^2 + curVel.Z^2)
+                                    if hSpeed >= 1 then
+                                        local travelTime = hDist / hSpeed
+                                        local neededYVel = math.clamp((targetPos.Y-myPos.Y)/travelTime + (0.5*196.2*travelTime), -200, 200)
+                                        local blendedY   = curVel.Y + (neededYVel - curVel.Y) * CORRECTION_STRENGTH
+                                        pcall(function() bv.Velocity = Vector3.new(curVel.X, blendedY, curVel.Z) end)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+RunService.Heartbeat:Connect(function()
+    local now = tick()
+
+    -- ── Grapple watcher ──────────────────────────────────
+    if UI.GetValue("grapple_correction") then
+        local localChar = localPlayer.Character
+        if localChar then
+            if localChar ~= localChar_last then
+                localChar_last = localChar; localSnapshot = buildSnapshot(localChar)
+            else
+                diffAndDetect(localChar, localSnapshot, "LOCAL")
+            end
+        end
+        if now - lastNearestCheck >= NEAREST_INTERVAL then
+            lastNearestCheck = now
+            local newNearest, newChar = getNearestChar()
+            if newNearest ~= lastNearestPlayer or newChar ~= lastNearestChar then
+                lastNearestPlayer = newNearest; lastNearestChar = newChar
+                nearestSnapshot = (newNearest and newChar) and buildSnapshot(newChar) or {}
+            end
+        end
+        if lastNearestChar and lastNearestPlayer then
+            local ok, parent = pcall(function() return lastNearestChar.Parent end)
+            if ok and parent then diffAndDetect(lastNearestChar, nearestSnapshot, "NEAREST")
+            else lastNearestChar = nil; nearestSnapshot = {} end
+        end
+    end
+
+    -- ── Notification expiry ───────────────────────────────
+    for i = #notifications, 1, -1 do
+        local notif = notifications[i]
+        if notif.removing then continue end
+        if tick() - notif.createdAt >= notif.duration and not notif.tweening then
+            table.remove(notifications, i)
+            removeNotification(notif, function() repositionNotifications() end)
+        end
+    end
+
+    -- ── Group detector player tracking ───────────────────
+    if UI.GetValue("group_detector") then
+        local newCurrentPlayers = {}
+        for _, player in ipairs(Players:GetPlayers()) do
+            newCurrentPlayers[player.UserId] = player
+            if not currentPlayers[player.UserId] and trackedPlayers[player.UserId] == nil then
+                trackedPlayers[player.UserId] = false
+                onPlayerJoined(player, false)
+            end
+        end
+        for userId, _ in pairs(currentPlayers) do
+            if not newCurrentPlayers[userId] then
+                trackedPlayers[userId] = nil
+                if groupMembersInServer[userId] then
+                    onPlayerLeft(userId, groupMembersInServer[userId])
+                end
+            end
+        end
+        currentPlayers = newCurrentPlayers
+    end
+
+    -- ── Spawn tracker update ─────────────────────────────
+    if UI.GetValue("spawn_tracker") then
+        local nowClock = os.clock()
+        if nowClock - spawnLastUpdate >= 5 then
+            spawnLastUpdate = nowClock
+            pcall(updateSpawnLabels)
+        end
+    end
+end)
+
+print("[Rogue Lineage] Loaded — UI tab active")
