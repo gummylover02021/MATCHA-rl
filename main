@@ -877,7 +877,7 @@ end
 -- ═════════════════════════════════════════════════════════
 --  MATCHA UI TAB
 -- ═════════════════════════════════════════════════════════
-UI.AddTab("Rogue Lineage", function(tab)
+UI.AddTab("SGW Rogue", function(tab)
 
     -- ── LEFT: Trinket ESP + Bane + Grapple ───────────────
     local combat = tab:Section("Combat & Detection", "Left")
