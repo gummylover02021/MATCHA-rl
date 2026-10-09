@@ -124,7 +124,6 @@ local function updateManaOverlay(toolName)
     local spell = SPELL_COST[toolName]
     if not spell or not spell[1] then clearManaOverlay(); return end
 
-    -- Find mana bar in PlayerGui
     local gui     = safeRead(function() return localPlayer.PlayerGui end)
     local statGui = gui and safeRead(function() return gui:FindFirstChild("StatGui") end)
     local leftC   = statGui and safeRead(function() return statGui:FindFirstChild("LeftContainer") end)
@@ -132,7 +131,6 @@ local function updateManaOverlay(toolName)
     if not manaBar then clearManaOverlay(); return end
 
     local scholar = getScholarBoost()
-
     local lowerbound = math.max(0,   spell[1][1] - scholar)
     local upperbound = math.min(100, spell[1][2] + scholar)
 
@@ -140,41 +138,41 @@ local function updateManaOverlay(toolName)
     local ok2, absSize = pcall(function() return manaBar.AbsoluteSize end)
     if not ok1 or not ok2 then clearManaOverlay(); return end
 
-    local baseX    = absPos.X
-    local baseY    = absPos.Y
-    local barW     = absSize.X
-    local barH     = absSize.Y
+    -- Debug: print position so we can verify
+    print(string.format("[ManaOverlay] bar pos=%.0f,%.0f size=%.0f,%.0f tool=%s",
+        absPos.X, absPos.Y, absSize.X, absSize.Y, toolName))
 
-    -- GuiInset Y offset
-    local ok3, inset = pcall(function()
-        return game:GetService("GuiService"):GetGuiInset().Y
-    end)
-    local topInset = ok3 and inset or 0
+    local baseX = absPos.X
+    local baseY = absPos.Y
+    local barW  = absSize.X
+    local barH  = absSize.Y
 
+    -- No GuiInset — Matcha Drawing uses raw screen coords
     local function getY(percent)
-        return baseY + barH * (1 - percent / 100) + topInset
+        return baseY + barH * (1 - percent / 100)
     end
 
-    -- Spell cast range (blue)
     local spellTop    = getY(upperbound)
     local spellBottom = getY(lowerbound)
-    spellvis.Position = Vector2.new(baseX, spellTop)
-    spellvis.Size     = Vector2.new(barW, math.abs(spellBottom - spellTop))
-    spellvis.Visible  = true
+    spellvis.Position    = Vector2.new(baseX, spellTop)
+    spellvis.Size        = Vector2.new(barW, math.abs(spellBottom - spellTop))
+    spellvis.Transparency = 0.4
+    spellvis.Visible     = true
 
-    -- Snap/sweet spot range (yellow)
     if spell[2] then
         local snapLower  = math.max(0,   spell[2][1] - scholar)
         local snapUpper  = math.min(100, spell[2][2] + scholar)
         local snapTop    = getY(snapUpper)
         local snapBottom = getY(snapLower)
-        snapvis.Position = Vector2.new(baseX, snapTop)
-        snapvis.Size     = Vector2.new(barW, math.abs(snapBottom - snapTop))
-        snapvis.Visible  = true
+        snapvis.Position    = Vector2.new(baseX, snapTop)
+        snapvis.Size        = Vector2.new(barW, math.abs(snapBottom - snapTop))
+        snapvis.Transparency = 0.4
+        snapvis.Visible     = true
     else
         snapvis.Visible = false
     end
 end
+
 -- ─────────────────────────────────────────────────────────
 --  MEMORY / OFFSETS
 -- ─────────────────────────────────────────────────────────
