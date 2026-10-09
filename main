@@ -117,6 +117,18 @@ local function clearManaOverlay()
     snapvis.Visible  = false
 end
 
+local GUI_ABSIZE_X = 260
+local GUI_ABSIZE_Y = 264
+
+local function readAbsoluteSize(instance)
+    local base = instance.Address
+    if not base or base == 0 then return nil, nil end
+    local ok1, w = pcall(memory_read, "float", base + GUI_ABSIZE_X)
+    local ok2, h = pcall(memory_read, "float", base + GUI_ABSIZE_Y)
+    if not ok1 or not ok2 then return nil, nil end
+    return w, h
+end
+
 local function updateManaOverlay(toolName)
     if not UI.GetValue("mana_overlay") then clearManaOverlay(); return end
     if not toolName then clearManaOverlay(); return end
@@ -124,30 +136,25 @@ local function updateManaOverlay(toolName)
     local spell = SPELL_COST[toolName]
     if not spell or not spell[1] then clearManaOverlay(); return end
 
-    local gui     = safeRead(function() return localPlayer.PlayerGui end)
+    local gui     = safeRead(function() return localPlayer:FindFirstChild("PlayerGui") end)
     local statGui = gui and safeRead(function() return gui:FindFirstChild("StatGui") end)
     local leftC   = statGui and safeRead(function() return statGui:FindFirstChild("LeftContainer") end)
-    local manaBar = leftC   and safeRead(function() return leftC:FindFirstChild("Mana") end)
+    local manaBar = leftC and safeRead(function() return leftC:FindFirstChild("Mana") end)
     if not manaBar then clearManaOverlay(); return end
 
-    local scholar = getScholarBoost()
+    local ok1, absPos = pcall(function() return manaBar.AbsolutePosition end)
+    if not ok1 then clearManaOverlay(); return end
+
+    local barW, barH = readAbsoluteSize(manaBar)
+    if not barW or not barH or barH == 0 then clearManaOverlay(); return end
+
+    local scholar    = getScholarBoost()
     local lowerbound = math.max(0,   spell[1][1] - scholar)
     local upperbound = math.min(100, spell[1][2] + scholar)
 
-    local ok1, absPos  = pcall(function() return manaBar.AbsolutePosition end)
-    local ok2, absSize = pcall(function() return manaBar.AbsoluteSize end)
-    if not ok1 or not ok2 then clearManaOverlay(); return end
-
-    -- Debug: print position so we can verify
-    print(string.format("[ManaOverlay] bar pos=%.0f,%.0f size=%.0f,%.0f tool=%s",
-        absPos.X, absPos.Y, absSize.X, absSize.Y, toolName))
-
     local baseX = absPos.X
     local baseY = absPos.Y
-    local barW  = absSize.X
-    local barH  = absSize.Y
 
-    -- No GuiInset — Matcha Drawing uses raw screen coords
     local function getY(percent)
         return baseY + barH * (1 - percent / 100)
     end
