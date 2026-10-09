@@ -175,35 +175,6 @@ local function updateManaOverlay(toolName)
         snapvis.Visible = false
     end
 end
-
--- Poll for equipped tool and update overlay every frame
-RunService.RenderStepped:Connect(function()
-    if not UI.GetValue("mana_overlay") then
-        clearManaOverlay()
-        currentEquippedTool = nil
-        return
-    end
-
-    local char = localPlayer and localPlayer.Character
-    if not char then clearManaOverlay(); return end
-
-    -- Find currently equipped tool (Tool instance in character)
-    local tool = safeRead(function()
-        for _, v in next, char:GetChildren() do
-            if v.ClassName == "Tool" then return v end
-        end
-        return nil
-    end)
-
-    local toolName = tool and safeRead(function() return tool.Name end)
-
-    if toolName ~= currentEquippedTool then
-        currentEquippedTool = toolName
-    end
-
-    updateManaOverlay(currentEquippedTool)
-end)
-
 -- ─────────────────────────────────────────────────────────
 --  MEMORY / OFFSETS
 -- ─────────────────────────────────────────────────────────
@@ -759,7 +730,6 @@ local function repositionNotifications()
 end
 
 local function createNotification(title, body, color, duration)
-    if not UI.GetValue("group_detector") then return end
     local notif = { title=title, body=body, color=color or Color3.fromRGB(60,120,255),
                     createdAt=tick(), duration=duration or DEFAULT_DUR, drawings={}, tweening=true, removing=false }
     local startY = NOTIF_Y
@@ -820,6 +790,7 @@ local function onPlayerJoined(player, isExisting)
     task.spawn(function()
         local inGroup, rank = isInGroup(player)
         if inGroup then
+            if not UI.GetValue("group_detector") then return end
             groupMembersInServer[player.UserId] = { name=player.Name, rank=rank }
             if isExisting then
                 createNotification("Group Member In Server", player.Name.." | "..(rank or "N/A"), Color3.fromRGB(255,180,0), EXISTING_DUR)
@@ -833,6 +804,7 @@ local function onPlayerJoined(player, isExisting)
 end
 
 local function onPlayerLeft(userId, data)
+  if not UI.GetValue("group_detector") then return end
     createNotification("Group Member Left", data.name.." | "..(data.rank or "N/A"), Color3.fromRGB(220,80,80))
     groupMembersInServer[userId] = nil
     repositionNotifications()
@@ -1038,18 +1010,6 @@ for _, player in next, Players:GetPlayers() do
     end
 end
 
-
-    if UI.GetValue("illusionist_detector") then
-        for _, player in ipairs(Players:GetPlayers()) do
-            local pid = safeRead(function() return player.UserId end)
-            if pid and pid ~= localPlayer.UserId and not illusionistList[pid] then
-                -- mark as pending so we don't spawn twice
-                illusionistList[pid] = { name = safeRead(function() return player.Name end) or "?", alerted = false, pending = true }
-                watchIllusionist(player)
-            end
-        end
-    end
-
 -- ═════════════════════════════════════════════════════════
 --  MATCHA UI TAB
 -- ═════════════════════════════════════════════════════════
@@ -1116,6 +1076,29 @@ end)
 --  MAIN LOOPS
 -- ═════════════════════════════════════════════════════════
 RunService.RenderStepped:Connect(function(dt)
+  -- ── Mana Overlay ─────────────────────────────────────
+    if UI.GetValue("mana_overlay") then
+        local char = localPlayer and localPlayer.Character
+        if char then
+            local tool = safeRead(function()
+                for _, v in next, char:GetChildren() do
+                    if v.ClassName == "Tool" then return v end
+                end
+                return nil
+            end)
+            local toolName = tool and safeRead(function() return tool.Name end)
+            if toolName ~= currentEquippedTool then
+                currentEquippedTool = toolName
+            end
+            updateManaOverlay(currentEquippedTool)
+        else
+            clearManaOverlay()
+        end
+    else
+        clearManaOverlay()
+        currentEquippedTool = nil
+    end
+
     -- ── Trinket ESP updates ──────────────────────────────
     local trinketOn  = UI.GetValue("trinket_esp")
     local trinketRng = UI.GetValue("trinket_range") or 75
@@ -1250,6 +1233,17 @@ RunService.Heartbeat:Connect(function()
         if tick() - notif.createdAt >= notif.duration and not notif.tweening then
             table.remove(notifications, i)
             removeNotification(notif, function() repositionNotifications() end)
+        end
+    end
+-- ── Illusionist Detector ───────────────────
+    if UI.GetValue("illusionist_detector") then
+        for _, player in ipairs(Players:GetPlayers()) do
+            local pid = safeRead(function() return player.UserId end)
+            if pid and pid ~= localPlayer.UserId and not illusionistList[pid] then
+                -- mark as pending so we don't spawn twice
+                illusionistList[pid] = { name = safeRead(function() return player.Name end) or "?", alerted = false, pending = true }
+                watchIllusionist(player)
+            end
         end
     end
 
