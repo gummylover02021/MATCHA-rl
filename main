@@ -220,9 +220,6 @@ local function clearManaOverlay()
     snapvis.Visible  = false
 end
 
-local GUI_ABSIZE_X = 260
-local GUI_ABSIZE_Y = 264
-
 local function readAbsoluteSize(instance)
     local base = instance.Address
     if not base or base == 0 then return nil, nil end
