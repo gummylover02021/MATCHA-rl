@@ -29,6 +29,182 @@ local function getRootPart(char)
 end
 
 -- ─────────────────────────────────────────────────────────
+--  MANA OVERLAY
+-- ─────────────────────────────────────────────────────────
+local SPELL_COST = {
+    ["Armis"]       = {{40, 60},  {70, 80}},
+    ["Trickstus"]   = {{30, 70},  {30, 50}},
+    ["Scrupus"]     = {{30, 100}, {30, 100}},
+    ["Celeritas"]   = {{70, 90},  {70, 80}},
+    ["Ignis"]       = {{80, 95},  {53, 57}},
+    ["Gelidus"]     = {{80, 95},  {85, 100}},
+    ["Viribus"]     = {{23, 35},  {60, 70}},
+    ["Sagitta Sol"] = {{50, 65},  {40, 60}},
+    ["Tenebris"]    = {{90, 100}, {40, 60}},
+    ["Nocere"]      = {{70, 85},  {70, 85}},
+    ["Hystericus"]  = {{75, 90},  {15, 35}},
+    ["Shrieker"]    = {{30, 50},  {30, 50}},
+    ["Verdien"]     = {{75, 100}, {75, 85}},
+    ["Contrarium"]  = {{80, 95},  {70, 90}},
+    ["Floresco"]    = {{90, 100}, {80, 95}},
+    ["Perflora"]    = {{70, 90},  {30, 50}},
+    ["Manus Dei"]   = {{90, 95},  {50, 60}},
+    ["Fons Vitae"]  = {{75, 100}, {75, 100}},
+    ["Trahere"]     = {{75, 85},  {75, 85}},
+    ["Furantur"]    = {{60, 80},  {60, 80}},
+    ["Inferi"]      = {{10, 30},  {10, 30}},
+    ["Howler"]      = {{60, 80},  {60, 80}},
+    ["Secare"]      = {{90, 95},  {90, 95}},
+    ["Ligans"]      = {{63, 80},  {63, 80}},
+    ["Reditus"]     = {{50, 100}, {50, 100}},
+    ["Fimbulvetr"]  = {{86, 90},  {70, 80}},
+    ["Gate"]        = {{75, 83},  {75, 83}},
+    ["Snarvindur"]  = {{60, 75},  {20, 30}},
+    ["Hoppa"]       = {{40, 60},  {50, 60}},
+    ["Percutiens"]  = {{60, 70},  {70, 80}},
+    ["Dominus"]     = {{50, 100}, {50, 100}},
+    ["Custos"]      = {{45, 65},  {45, 65}},
+    ["Claritum"]    = {{90, 100}, {90, 100}},
+    ["Globus"]      = {{70, 100}, {70, 100}},
+    ["Intermissum"] = {{70, 100}, {70, 100}},
+    ["Sraunus"]     = {{1, 50},   {1, 50}},
+    ["Nosferatus"]  = {{95, 100}, {95, 100}},
+    ["Gourdus"]     = {{80, 90},  {80, 90}},
+    ["Telorum"]     = {{80, 90},  {75, 85}},
+    ["Velo"]        = {{0, 100},  {50, 60}},
+}
+
+-- Drawings for the mana overlay
+local spellvis = Drawing.new("Square")
+spellvis.Filled       = true
+spellvis.Color        = Color3.fromRGB(100, 180, 255)
+spellvis.Transparency = 0.5
+spellvis.Visible      = false
+spellvis.ZIndex       = 20
+
+local snapvis = Drawing.new("Square")
+snapvis.Filled       = true
+snapvis.Color        = Color3.fromRGB(255, 220, 80)
+snapvis.Transparency = 0.5
+snapvis.Visible      = false
+snapvis.ZIndex       = 21
+
+local currentEquippedTool = nil
+
+local function getScholarBoost()
+    local boost = 0
+    local char = localPlayer and localPlayer.Character
+    if char then
+        local boosts = char:FindFirstChild("Boosts")
+        if boosts then
+            local sb = boosts:FindFirstChild("ScholarsBoon")
+            if sb then
+                local ok, v = pcall(function() return sb.Value end)
+                if ok and v then boost = boost + v end
+            end
+        end
+    end
+    local backpack = safeRead(function() return localPlayer:FindFirstChildOfClass("Backpack") end)
+    if backpack then
+        if backpack:FindFirstChild("WiseCasting")  then boost = boost + 2 end
+        if backpack:FindFirstChild("RemTraining")  then boost = boost + 3 end
+    end
+    return boost
+end
+
+local function clearManaOverlay()
+    spellvis.Visible = false
+    snapvis.Visible  = false
+end
+
+local function updateManaOverlay(toolName)
+    if not UI.GetValue("mana_overlay") then clearManaOverlay(); return end
+    if not toolName then clearManaOverlay(); return end
+
+    local spell = SPELL_COST[toolName]
+    if not spell or not spell[1] then clearManaOverlay(); return end
+
+    -- Find mana bar in PlayerGui
+    local gui     = safeRead(function() return localPlayer.PlayerGui end)
+    local statGui = gui and safeRead(function() return gui:FindFirstChild("StatGui") end)
+    local leftC   = statGui and safeRead(function() return statGui:FindFirstChild("LeftContainer") end)
+    local manaBar = leftC   and safeRead(function() return leftC:FindFirstChild("Mana") end)
+    if not manaBar then clearManaOverlay(); return end
+
+    local scholar = getScholarBoost()
+
+    local lowerbound = math.max(0,   spell[1][1] - scholar)
+    local upperbound = math.min(100, spell[1][2] + scholar)
+
+    local ok1, absPos  = pcall(function() return manaBar.AbsolutePosition end)
+    local ok2, absSize = pcall(function() return manaBar.AbsoluteSize end)
+    if not ok1 or not ok2 then clearManaOverlay(); return end
+
+    local baseX    = absPos.X
+    local baseY    = absPos.Y
+    local barW     = absSize.X
+    local barH     = absSize.Y
+
+    -- GuiInset Y offset
+    local ok3, inset = pcall(function()
+        return game:GetService("GuiService"):GetGuiInset().Y
+    end)
+    local topInset = ok3 and inset or 0
+
+    local function getY(percent)
+        return baseY + barH * (1 - percent / 100) + topInset
+    end
+
+    -- Spell cast range (blue)
+    local spellTop    = getY(upperbound)
+    local spellBottom = getY(lowerbound)
+    spellvis.Position = Vector2.new(baseX, spellTop)
+    spellvis.Size     = Vector2.new(barW, math.abs(spellBottom - spellTop))
+    spellvis.Visible  = true
+
+    -- Snap/sweet spot range (yellow)
+    if spell[2] then
+        local snapLower  = math.max(0,   spell[2][1] - scholar)
+        local snapUpper  = math.min(100, spell[2][2] + scholar)
+        local snapTop    = getY(snapUpper)
+        local snapBottom = getY(snapLower)
+        snapvis.Position = Vector2.new(baseX, snapTop)
+        snapvis.Size     = Vector2.new(barW, math.abs(snapBottom - snapTop))
+        snapvis.Visible  = true
+    else
+        snapvis.Visible = false
+    end
+end
+
+-- Poll for equipped tool and update overlay every frame
+RunService.RenderStepped:Connect(function()
+    if not UI.GetValue("mana_overlay") then
+        clearManaOverlay()
+        currentEquippedTool = nil
+        return
+    end
+
+    local char = localPlayer and localPlayer.Character
+    if not char then clearManaOverlay(); return end
+
+    -- Find currently equipped tool (Tool instance in character)
+    local tool = safeRead(function()
+        for _, v in next, char:GetChildren() do
+            if v.ClassName == "Tool" then return v end
+        end
+        return nil
+    end)
+
+    local toolName = tool and safeRead(function() return tool.Name end)
+
+    if toolName ~= currentEquippedTool then
+        currentEquippedTool = toolName
+    end
+
+    updateManaOverlay(currentEquippedTool)
+end)
+
+-- ─────────────────────────────────────────────────────────
 --  MEMORY / OFFSETS
 -- ─────────────────────────────────────────────────────────
 local Offsets = {
@@ -919,6 +1095,11 @@ UI.AddTab("SGW Rogue", function(tab)
     utility:Spacing()
     utility:Toggle("illusionist_detector", "Illusionist Detector", true)
     utility:Keybind("illusionist_detector_kb", 0, "toggle")
+
+    -- Mana Overlay
+    utility:Spacing()
+    utility:Toggle("mana_overlay", "Mana Overlay", false)
+    utility:Keybind("mana_overlay_kb", 0, "toggle")
 
     -- Monster Spawn Tracker
     utility:Toggle("spawn_tracker", "Spawn Tracker", false, function(state)
