@@ -1,12 +1,15 @@
 --[[
     Rogue Lineage — Matcha UI
     Combines: Trinket ESP, Bane TP, Grapple Correction,
-              Group Detector (mod detect), Monster Spawn Tracker
+              Group Detector (mod detect), Monster Spawn Tracker,
+              Mana Color (client-side recolor)
 ]]
 
 -- ─────────────────────────────────────────────────────────
 --  SERVICES
 -- ─────────────────────────────────────────────────────────
+print("[RL] v3 script start - memory colour bridge build")
+
 local RunService  = game:GetService("RunService")
 local Players     = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
@@ -39,6 +42,9 @@ local Offsets = {
     Misc_StringLength      = 16,
     GUI_AbsSize_X          = 260,
     GUI_AbsSize_Y          = 264,
+    GuiObject_BackgroundColor3 = 1328,   -- Color3 = 3 floats (R,G,B)
+    GuiObject_BorderColor3     = 1340,
+    GuiObject_TextColor3       = 3768,
 }
 local SPECIALMESH_MESHID_OFFSET = 248
 
@@ -52,8 +58,15 @@ local function applyOffsets(data)
     if O.Misc            and O.Misc.StringLength         then Offsets.Misc_StringLength      = O.Misc.StringLength      end
     if O.GUI             and O.GUI.AbsSize_X             then Offsets.GUI_AbsSize_X          = O.GUI.AbsSize_X          end
     if O.GUI             and O.GUI.AbsSize_Y             then Offsets.GUI_AbsSize_Y          = O.GUI.AbsSize_Y          end
+    if O.GuiObject then
+        if O.GuiObject.BackgroundColor3 then Offsets.GuiObject_BackgroundColor3 = O.GuiObject.BackgroundColor3 end
+        if O.GuiObject.BorderColor3     then Offsets.GuiObject_BorderColor3     = O.GuiObject.BorderColor3     end
+        if O.GuiObject.TextColor3       then Offsets.GuiObject_TextColor3       = O.GuiObject.TextColor3       end
+    end
     return true
 end
+
+local lastOffsetsRaw = nil
 
 task.spawn(function()
     local sources = {
@@ -66,6 +79,7 @@ task.spawn(function()
         if ok and result and #result > 10 then
             local ok2, data = pcall(function() return HttpService:JSONDecode(result) end)
             if ok2 and data and applyOffsets(data) then
+                lastOffsetsRaw = result
                print(string.format("[RL] offsets from %s | MeshId=%d Rate=%d GuiSizeX=%d GuiSizeY=%d",
                 url:match("([^/]+%.[^/]+)/") or url,
                 Offsets.MeshPart_MeshId, Offsets.ParticleEmitter_Rate,
@@ -229,6 +243,16 @@ local function readAbsoluteSize(instance)
     return w, h
 end
 
+local function getManaColor()
+    if UI.GetValue("mana_rainbow") then
+        return Color3.fromHSV((tick() * 0.35) % 1, 0.8, 1)
+    end
+    return Color3.fromRGB(
+        math.clamp(tonumber(UI.GetValue("mana_r")) or 100, 0, 255),
+        math.clamp(tonumber(UI.GetValue("mana_g")) or 180, 0, 255),
+        math.clamp(tonumber(UI.GetValue("mana_b")) or 255, 0, 255))
+end
+
 local function updateManaOverlay(toolName)
     if not UI.GetValue("mana_overlay") then clearManaOverlay(); return end
     if not toolName then clearManaOverlay(); return end
@@ -259,6 +283,12 @@ local function updateManaOverlay(toolName)
         return baseY + barH * (1 - percent / 100)
     end
 
+    if UI.GetValue("mana_color") then
+        spellvis.Color = getManaColor()
+    else
+        spellvis.Color = Color3.fromRGB(100, 180, 255)
+    end
+
     local spellTop    = getY(upperbound)
     local spellBottom = getY(lowerbound)
     spellvis.Position    = Vector2.new(baseX, spellTop)
@@ -281,6 +311,381 @@ local function updateManaOverlay(toolName)
 end
 
 -- ═════════════════════════════════════════════════════════
+--  MANA COLOR (client-side HUD recolor)
+--  Targets (cached 1.5s, re-applied EVERY frame):
+--    * every UIGradient under anything mana-named in PlayerGui
+--    * fill-like Frames/Images/Text under mana-named trees,
+--      the StatGui.LeftContainer path, or hint-named siblings
+--    * Color3Value hooks (GUI + character)
+--  Originals are snapshotted (weak-keyed) and restored on disable.
+--  If the game overrides our writes, a one-time warning prints.
+-- ═════════════════════════════════════════════════════════
+local manaColorSnap      = setmetatable({}, { __mode = "k" })
+local manaColorApplied   = false
+local manaColorCache     = nil
+local manaColorCacheTime = 0
+local MANA_CACHE_REFRESH = 1.5
+-- (memory colour state lives above with the bridge helpers)
+
+local MANA_NAME_HINTS = { "fill", "bar", "color", "mana", "tint",
+                          "gradient", "gauge", "liquid", "meter", "progress" }
+
+local function manaNameMatches(inst)
+    local n = safeRead(function() return inst.Name end)
+    if not n then return false end
+    n = n:lower()
+    for _, p in next, MANA_NAME_HINTS do
+        if n:find(p, 1, true) then return true end
+    end
+    return false
+end
+
+-- ── memory colour bridge ─────────────────────────────────
+-- This VM's property bridge rejects colour properties ("Unknown
+-- property"), but memory_read/memory_write work on GUI instances.
+-- Color3 at GuiObject+BackgroundColor3 is stored as 3 floats.
+
+local memWriteSig    = nil        -- calibrated once: "tav" | "av" | "atv"
+local memWriteWarned = false
+
+local function tryMemWrite(sig, addr, v)
+    if sig == "tav" then return pcall(memory_write, "float", addr, v) end
+    if sig == "av"  then return pcall(memory_write, addr, v)          end
+    if sig == "atv" then return pcall(memory_write, addr, "float", v) end
+    return false
+end
+
+local function memWriteFloat(addr, v)
+    if not memWriteSig then
+        for _, sig in next, { "tav", "av", "atv" } do
+            local ok = tryMemWrite(sig, addr, v)
+            if ok then
+                local rv = safeRead(function() return memory_read("float", addr) end)
+                if rv and math.abs(rv - v) < 0.001 then
+                    memWriteSig = sig
+                    print("[ManaColor] memory_write signature calibrated: " .. sig)
+                    return true
+                end
+            end
+        end
+        if not memWriteWarned then
+            memWriteWarned = true
+            print("[ManaColor] memory_write failed with every signature - colour writes unavailable")
+        end
+        return false
+    end
+    return tryMemWrite(memWriteSig, addr, v)
+end
+
+-- read a Color3 from memory; nil if the floats don't look like a colour
+local function readColorMem(inst, off)
+    local a = safeRead(function() return inst.Address end)
+    if not a then return nil end
+    local r = safeRead(function() return memory_read("float", a + off)     end)
+    local g = safeRead(function() return memory_read("float", a + off + 4) end)
+    local b = safeRead(function() return memory_read("float", a + off + 8) end)
+    if r and g and b
+    and r >= -0.001 and r <= 1.001
+    and g >= -0.001 and g <= 1.001
+    and b >= -0.001 and b <= 1.001 then
+        return { r = r, g = g, b = b }
+    end
+    return nil
+end
+
+local function writeColorMem(inst, off, col)
+    local a = safeRead(function() return inst.Address end)
+    if not a then return false end
+    if not memWriteFloat(a + off,     col.R) then return false end
+    if not memWriteFloat(a + off + 4, col.G) then return false end
+    if not memWriteFloat(a + off + 8, col.B) then return false end
+    return true
+end
+
+-- fill-ish element names inside the mana tree (Slider = the fill,
+-- Divider = the line at the fill surface; skip Mana track & Overlay)
+local FILL_NAMES = { "slider", "divider", "fill", "bar", "gauge",
+                     "liquid", "meter", "progress" }
+
+local function isFillName(inst)
+    local n = safeRead(function() return inst.Name end)
+    if not n then return false end
+    n = n:lower()
+    for _, p in next, FILL_NAMES do
+        if n:find(p, 1, true) then return true end
+    end
+    return false
+end
+
+local function guiPath(inst)
+    local parts = {}
+    local cur = inst
+    while cur and #parts < 14 do
+        local n = safeRead(function() return cur.Name end)
+        if not n or n == "" then break end
+        parts[#parts + 1] = n
+        cur = safeRead(function() return cur.Parent end)
+    end
+    for k = 1, math.floor(#parts / 2) do
+        parts[k], parts[#parts - k + 1] = parts[#parts - k + 1], parts[k]
+    end
+    return table.concat(parts, ".")
+end
+
+local function addTree(list, set, root)
+    if not root then return end
+    list[#list + 1] = root; set[root] = true
+    local desc = safeRead(function() return root:GetDescendants() end)
+    if desc then
+        for _, d in next, desc do list[#list + 1] = d; set[d] = true end
+    end
+end
+
+local function manaColorTargets()
+    local list, set = {}, {}
+    local gui = safeRead(function() return localPlayer:FindFirstChild("PlayerGui") end)
+    if gui then
+        -- 1. anything mana-named ANYWHERE in PlayerGui (bar may not
+        --    live under StatGui.LeftContainer.Mana at all)
+        local desc = safeRead(function() return gui:GetDescendants() end) or {}
+        for _, d in next, desc do
+            local n = safeRead(function() return d.Name end)
+            if n and n:lower():find("mana", 1, true) then
+                addTree(list, set, d)
+            end
+        end
+        -- 2. known path + hint-named siblings of Mana (fills are
+        --    often siblings, not children)
+        local statGui = safeRead(function() return gui:FindFirstChild("StatGui") end)
+        local leftC   = statGui and safeRead(function() return statGui:FindFirstChild("LeftContainer") end)
+        local manaBar = leftC and safeRead(function() return leftC:FindFirstChild("Mana") end)
+        if manaBar then addTree(list, set, manaBar) end
+        if leftC then
+            local kids = safeRead(function() return leftC:GetChildren() end)
+            if kids then
+                for _, k in next, kids do
+                    if manaNameMatches(k) then addTree(list, set, k) end
+                end
+            end
+        end
+    end
+    -- 3. Color3Value hooks on the character
+    local char = safeRead(function() return localPlayer.Character end)
+    if char then
+        local kids = safeRead(function() return char:GetChildren() end)
+        if kids then
+            for _, v in next, kids do
+                local cls = safeRead(function() return v.ClassName end)
+                if cls == "Color3Value" and manaNameMatches(v) then
+                    list[#list + 1] = v; set[v] = true
+                end
+            end
+        end
+    end
+    return list, set
+end
+
+local function colorsClose(a, b)
+    if not a or not b then return false end
+    return math.abs(a.R - b.R) < 0.01 and math.abs(a.G - b.G) < 0.01 and math.abs(a.B - b.B) < 0.01
+end
+
+local function applyManaColor(col, list, manaSet)   -- col == nil -> restore originals
+    for _, inst in next, (list or {}) do
+        local cls = safeRead(function() return inst.ClassName end)
+        if not cls then continue end
+        local inTree = (manaSet and manaSet[inst]) or false
+
+        if cls == "UIGradient" then
+            -- property-only (no memory offsets published for gradients)
+            local snap = manaColorSnap[inst]
+            if col then
+                if not snap then
+                    manaColorSnap[inst] = { gradient = safeRead(function() return inst.Color end) }
+                end
+                pcall(function() inst.Color = ColorSequence.new(col) end)
+            elseif snap and snap.gradient then
+                pcall(function() inst.Color = snap.gradient end)
+            end
+
+        elseif cls == "Color3Value" then
+            local snap = manaColorSnap[inst]
+            if col then
+                if not snap then
+                    manaColorSnap[inst] = { value = safeRead(function() return inst.Value end) }
+                end
+                pcall(function() inst.Value = col end)
+            elseif snap and snap.value then
+                pcall(function() inst.Value = snap.value end)
+            end
+
+        elseif cls == "Frame" or cls == "ImageLabel" or cls == "ImageButton"
+            or cls == "TextLabel" or cls == "TextButton" then
+            -- recolor fill-ish elements (Slider / Divider / Fill / Bar);
+            -- outside the mana tree, fall back to the name hints
+            local allowed = isFillName(inst) or (not inTree and manaNameMatches(inst))
+            if not allowed then continue end
+
+            local snap = manaColorSnap[inst]
+            if col then
+                if not snap then
+                    snap = {
+                        bg  = safeRead(function() return inst.BackgroundColor3 end),
+                        img = safeRead(function() return inst.ImageColor3    end),
+                        txt = safeRead(function() return inst.TextColor3     end),
+                        mem = readColorMem(inst, Offsets.GuiObject_BackgroundColor3),
+                    }
+                    manaColorSnap[inst] = snap
+                end
+                -- 1) property write (VMs with a full property bridge)
+                local wrote = false
+                if cls == "Frame" or cls == "TextButton" or cls == "TextLabel" then
+                    wrote = pcall(function() inst.BackgroundColor3 = col end)
+                end
+                if cls == "ImageLabel" or cls == "ImageButton" then
+                    wrote = pcall(function() inst.ImageColor3 = col end)
+                end
+                if cls == "TextLabel" then
+                    pcall(function() inst.TextColor3 = col end)
+                end
+                -- 2) memory fallback (THIS VM: property writes throw)
+                if not wrote and snap.mem then
+                    writeColorMem(inst, Offsets.GuiObject_BackgroundColor3, col)
+                end
+            elseif snap then
+                if snap.bg  then pcall(function() inst.BackgroundColor3 = snap.bg  end) end
+                if snap.img then pcall(function() inst.ImageColor3    = snap.img end) end
+                if snap.txt then pcall(function() inst.TextColor3     = snap.txt end) end
+                if snap.mem then
+                    writeColorMem(inst, Offsets.GuiObject_BackgroundColor3,
+                                  { R = snap.mem.r, G = snap.mem.g, B = snap.mem.b })
+                end
+            end
+        end
+    end
+end
+
+local function colStr(c)
+    local ok, r, g, b = pcall(function() return c.R, c.G, c.B end)
+    if not ok or type(r) ~= "number" then return tostring(c) end
+    return string.format("(%d,%d,%d)",
+        math.floor(r * 255 + 0.5), math.floor(g * 255 + 0.5), math.floor(b * 255 + 0.5))
+end
+
+local function probeProp(inst, prop)
+    local ok, v = pcall(function() return inst[prop] end)
+    if ok then
+        if v == nil then return prop .. " = <nil>" end
+        return prop .. " = " .. tostring(v)
+    end
+    return prop .. " READ-ERROR: " .. tostring(v)
+end
+
+local function dumpInst(inst, indent)
+    local nm   = safeRead(function() return inst.Name end) or "?"
+    local cls  = safeRead(function() return inst.ClassName end) or "?"
+    local addr = safeRead(function() return inst.Address end)
+    print(string.format("%s[%s] %s  addr=%s", indent, cls, nm, tostring(addr)))
+    local props
+    if cls == "ImageLabel" or cls == "ImageButton" then
+        props = { "Image", "ImageColor3", "ImageTransparency", "Visible", "AbsolutePosition" }
+    elseif cls == "TextLabel" then
+        props = { "Text", "TextColor3", "Visible" }
+    elseif cls == "UIGradient" then
+        props = { "Color", "Offset", "Rotation" }
+    else
+        props = { "BackgroundColor3", "BackgroundTransparency", "Visible", "AbsolutePosition" }
+    end
+    for _, p in next, props do
+        print(indent .. "  " .. probeProp(inst, p))
+    end
+end
+
+local function dumpManaGui()
+    print("============ [ManaColor] DIAGNOSTIC v3 ============")
+    local gui = safeRead(function() return localPlayer:FindFirstChild("PlayerGui") end)
+    if not gui then print("(no PlayerGui)") return end
+    local statGui = safeRead(function() return gui:FindFirstChild("StatGui") end)
+    local leftC   = statGui and safeRead(function() return statGui:FindFirstChild("LeftContainer") end)
+    local manaBar = leftC and safeRead(function() return leftC:FindFirstChild("Mana") end)
+    if not manaBar then print("(StatGui.LeftContainer.Mana not found)") return end
+
+    -- 1. does the memory bridge work on GUI instances?
+    do
+        local ok1, w  = pcall(memory_read, "float", manaBar.Address + Offsets.GUI_AbsSize_X)
+        local ok2, h  = pcall(memory_read, "float", manaBar.Address + Offsets.GUI_AbsSize_Y)
+        print(string.format("[mem bridge] Mana AbsSize: w=%s h=%s (%s)",
+            tostring(w), tostring(h), (ok1 and ok2) and "reads OK" or "reads FAILED"))
+    end
+
+    -- 2. property probe: Mana subtree deep + all LeftContainer siblings
+    print("---- LeftContainer children (Mana subtree deep) ----")
+    local kids = safeRead(function() return leftC:GetChildren() end) or {}
+    for _, k in next, kids do
+        if k == manaBar then
+            dumpInst(manaBar, "  ")
+            local sd = safeRead(function() return manaBar:GetDescendants() end) or {}
+            for _, d in next, sd do dumpInst(d, "      ") end
+        else
+            dumpInst(k, "  ")
+        end
+    end
+
+    -- 3. memory colour probe: what colour is each element right now?
+    print("---- memory colour probe (BackgroundColor3 @ " .. tostring(Offsets.GuiObject_BackgroundColor3) .. ") ----")
+    for _, nm in next, { "Mana", "Slider", "Divider", "Overlay" } do
+        local inst = (nm == "Mana") and manaBar
+                    or safeRead(function() return manaBar:FindFirstChild(nm) end)
+        if inst then
+            local m = readColorMem(inst, Offsets.GuiObject_BackgroundColor3)
+            if m then
+                print(string.format("  %-8s floats OK   R=%.3f G=%.3f B=%.3f", nm, m.r, m.g, m.b))
+            else
+                local a = safeRead(function() return inst.Address end)
+                local r = a and safeRead(function() return memory_read("float", a + Offsets.GuiObject_BackgroundColor3)      end)
+                local g = a and safeRead(function() return memory_read("float", a + Offsets.GuiObject_BackgroundColor3 + 4)  end)
+                local b = a and safeRead(function() return memory_read("float", a + Offsets.GuiObject_BackgroundColor3 + 8)  end)
+                print(string.format("  %-8s NOT colour floats (R=%s G=%s B=%s)", nm, tostring(r), tostring(g), tostring(b)))
+            end
+        end
+    end
+
+    -- 4. LIVE MEMORY WRITE - watch your bar while reading this
+    print("---- live memory write test (current UI colour) ----")
+    do
+        local slider = safeRead(function() return manaBar:FindFirstChild("Slider") end)
+        if slider then
+            local col = getManaColor()
+            local ok = writeColorMem(slider, Offsets.GuiObject_BackgroundColor3, col)
+            print("  Slider memory write: " .. (ok
+                and "WRITTEN - the fill should be tinted RIGHT NOW"
+                or  "FAILED - check the signature/failure prints above"))
+            local back = readColorMem(slider, Offsets.GuiObject_BackgroundColor3)
+            if back then
+                print(string.format("  readback: R=%.3f G=%.3f B=%.3f", back.r, back.g, back.b))
+            end
+        end
+    end
+
+    -- 4. which memory primitives exist?
+    print("---- primitives ----")
+    for _, name in next, { "memory_read", "memory_write", "write_memory", "writemem",
+                           "memory_write_float", "write_float", "setmemory" } do
+        local ok, t = pcall(function() return type(_G[name]) end)
+        print("  " .. name .. " -> " .. ((ok and t) and t or "?"))
+    end
+
+    -- 5. offsets JSON preview (for a memory-write fallback)
+    print("---- offsets json preview ----")
+    if lastOffsetsRaw then
+        print(lastOffsetsRaw:sub(1, 500))
+    else
+        print("(raw json not stored)")
+    end
+    print("============ end diagnostic v3 - if any line above says 'write test (using current UI sliders colour)' you ran the OLD copy ============")
+end
+
+-- -- ═════════════════════════════════════════════════════════
 --  TRINKET ESP
 -- ═════════════════════════════════════════════════════════
 local trinket_colors = {
@@ -916,7 +1321,7 @@ local function updateSpawnLabels()
         else
             local diff = math.max(0, now - raw)
             local ago  = formatSpawnTime(diff)
-            lbl.Text  = loc.name.." - "..ago.." ago"
+            lbl.Text  =loc.name.." - "..ago.." ago"
             lbl.Color = diff < 300 and Color3.fromRGB(220,140,145)
                      or diff < 1800 and Color3.fromRGB(238,185,128)
                      or Color3.fromRGB(228,230,240)
@@ -1021,6 +1426,8 @@ end
 -- ═════════════════════════════════════════════════════════
 --  MATCHA UI TAB
 -- ═════════════════════════════════════════════════════════
+print("[RL] v3 pre-UI - if you see this but no tab appears, the copy is truncated")
+
 UI.AddTab("SGW Rogue", function(tab)
 
     -- ── LEFT: Trinket ESP + Bane + Grapple ───────────────
@@ -1069,6 +1476,18 @@ UI.AddTab("SGW Rogue", function(tab)
     utility:Toggle("mana_overlay", "Mana Overlay", false)
     utility:Keybind("mana_overlay_kb", 0, "toggle")
 
+    -- Mana Color (client-side)
+    utility:Spacing()
+    utility:Toggle("mana_color", "Custom Mana Color", false)
+    utility:Keybind("mana_color_kb", 0, "toggle")
+    utility:SliderInt("mana_r", "Mana Red",   0, 255, 100, function(v) end)
+    utility:SliderInt("mana_g", "Mana Green", 0, 255, 180, function(v) end)
+    utility:SliderInt("mana_b", "Mana Blue",  0, 255, 255, function(v) end)
+    utility:Toggle("mana_rainbow", "Rainbow Mana", false)
+    utility:Toggle("mana_dump", "Dump Mana GUI (console)", false, function(state)
+        if state then task.spawn(dumpManaGui) end
+    end)
+
     -- Monster Spawn Tracker
     utility:Toggle("spawn_tracker", "Spawn Tracker", false, function(state)
         spawnTrackerEnabled = state
@@ -1105,6 +1524,22 @@ RunService.RenderStepped:Connect(function(dt)
     else
         clearManaOverlay()
         currentEquippedTool = nil
+    end
+
+    -- ── Mana color (client-side, every frame) ────────────
+    if UI.GetValue("mana_color") then
+        if not manaColorCache or (tick() - manaColorCacheTime) > MANA_CACHE_REFRESH then
+            local list, set = manaColorTargets()
+            manaColorCache     = { list = list, set = set }
+            manaColorCacheTime = tick()
+        end
+        applyManaColor(getManaColor(), manaColorCache.list, manaColorCache.set)
+        manaColorApplied = true
+    elseif manaColorApplied then
+        local list = manaColorCache and manaColorCache.list or {}
+        manaColorApplied = false
+        manaColorCache   = nil
+        applyManaColor(nil, list)
     end
 
     -- ── Trinket ESP updates ──────────────────────────────
@@ -1243,7 +1678,7 @@ RunService.Heartbeat:Connect(function()
             removeNotification(notif, function() repositionNotifications() end)
         end
     end
--- ── Illusionist Detector ───────────────────
+-- ── Illusionist Detector ───────────────────────────
     if UI.GetValue("illusionist_detector") then
         for _, player in ipairs(Players:GetPlayers()) do
             local pid = safeRead(function() return player.UserId end)
@@ -1284,6 +1719,7 @@ RunService.Heartbeat:Connect(function()
             pcall(updateSpawnLabels)
         end
     end
+
 end)
 
-print("[Rogue Lineage] Loaded — UI tab active")
+print("[Rogue Lineage] v3 Loaded - UI tab active (" .. _VERSION .. ")")
