@@ -888,8 +888,7 @@ end)
 --  BANE TP
 -- ═════════════════════════════════════════════════════════
 local STAND_OFFSET = 2
-local LERP_SPEED   = 14
-local DONE_DIST    = 0.8
+local DONE_DIST    = 0.4   -- was 0.8, snap earlier to avoid the final chunk
 local interpActive = false
 local interpTimer  = 0
 local interpGoal   = nil
@@ -1564,6 +1563,7 @@ RunService.RenderStepped:Connect(function(dt)
     if UI.GetValue("bane_tp") then
         local baneRadius = UI.GetValue("bane_radius") or 15
         local attackNow  = isAttacking()
+
         if attackNow and not wasAttacking and not interpActive and hasBaneEff() then
             local myRoot = getLocalRootPart()
             if myRoot then
@@ -1576,8 +1576,15 @@ RunService.RenderStepped:Connect(function(dt)
                 if target then
                     local ok, cf = pcall(buildGoalCFrame, target, myRoot)
                     if ok and cf then
-                        interpGoal = cf; interpActive = true; interpTimer = 0
-                        interpName = safeRead(function() return target.Parent.Name end) or "?"
+                        interpGoal   = cf
+                        interpActive = true
+                        interpTimer  = 0
+                        interpName   = safeRead(function() return target.Parent.Name end) or "?"
+                        -- zero velocity immediately so physics doesn't fight the lerp
+                        pcall(function()
+                            myRoot.AssemblyLinearVelocity  = Vector3.zero
+                            myRoot.AssemblyAngularVelocity = Vector3.zero
+                        end)
                     end
                 end
             end
@@ -1586,6 +1593,7 @@ RunService.RenderStepped:Connect(function(dt)
 
         if interpActive and interpGoal then
             interpTimer = interpTimer + dt
+
             if interpTimer > 0.2 or isRagdolled() then
                 interpActive = false; interpGoal = nil; interpTimer = 0
             else
@@ -1593,13 +1601,23 @@ RunService.RenderStepped:Connect(function(dt)
                 if myRoot then
                     local current = myRoot.CFrame
                     local dist    = (current.Position - interpGoal.Position).Magnitude
+
                     if dist < DONE_DIST then
-                        pcall(function() myRoot.CFrame = interpGoal; myRoot.AssemblyLinearVelocity=Vector3.zero; myRoot.AssemblyAngularVelocity=Vector3.zero end)
+                        pcall(function()
+                            myRoot.CFrame                  = interpGoal
+                            myRoot.AssemblyLinearVelocity  = Vector3.zero
+                            myRoot.AssemblyAngularVelocity = Vector3.zero
+                        end)
                         interpActive = false; interpGoal = nil; interpTimer = 0
                     else
-                        local speedScale = math.clamp(dist/5, 0.4, 1)
-                        local alpha      = math.clamp(LERP_SPEED * speedScale * dt, 0, 1)
-                        pcall(function() myRoot.CFrame = current:Lerp(interpGoal, alpha); myRoot.AssemblyLinearVelocity = myRoot.AssemblyLinearVelocity * 0.3 end)
+                        -- framerate-independent lerp: higher speed = less chunky
+                        -- 1 - (1-rate)^dt gives consistent feel at any FPS
+                        local SMOOTH = 28  -- increase for faster snap, decrease for floatier
+                        local alpha  = 1 - (1 - math.min(SMOOTH * dt, 0.99))
+                        pcall(function()
+                            myRoot.CFrame                 = current:Lerp(interpGoal, alpha)
+                            myRoot.AssemblyLinearVelocity = myRoot.AssemblyLinearVelocity * 0.05
+                        end)
                     end
                 else
                     interpActive = false; interpGoal = nil; interpTimer = 0
@@ -1608,7 +1626,7 @@ RunService.RenderStepped:Connect(function(dt)
         end
     else
         wasAttacking = false
-        if interpActive then interpActive=false; interpGoal=nil; interpTimer=0 end
+        if interpActive then interpActive = false; interpGoal = nil; interpTimer = 0 end
     end
 
     -- ── Grapple correction ───────────────────────────────
