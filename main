@@ -899,8 +899,12 @@ local wasAttacking = false
 local function hasBaneEff()
     local char = localPlayer and localPlayer.Character
     if not char then return false end
-    for _, v in next, char:GetChildren() do
-        if v.ClassName == "Accessory" and v.Name == "BaneEff" then return true end
+    local ok, children = pcall(function() return char:GetChildren() end)
+    if not ok then return false end
+    for _, v in next, children do
+        local cn = safeRead(function() return v.ClassName end)
+        local nm = safeRead(function() return v.Name end)
+        if cn == "Accessory" and nm == "BaneEff" then return true end
     end
     return false
 end
@@ -908,8 +912,12 @@ end
 local function isAttacking()
     local char = localPlayer and localPlayer.Character
     if not char then return false end
-    for _, v in next, char:GetChildren() do
-        if v.ClassName == "Accessory" and v.Name == "LightAttack" then return true end
+    local ok, children = pcall(function() return char:GetChildren() end)
+    if not ok then return false end
+    for _, v in next, children do
+        local cn = safeRead(function() return v.ClassName end)
+        local nm = safeRead(function() return v.Name end)
+        if cn == "Accessory" and nm == "LightAttack" then return true end
     end
     return false
 end
@@ -1641,11 +1649,16 @@ RunService.RenderStepped:Connect(function(dt)
     end
 end)
 
+local _diffLastRun = 0
+local DIFF_RATE    = 0.1  -- grapple diff at 10x/sec, plenty to catch GrappleVelocity
+
 RunService.Heartbeat:Connect(function()
     local now = tick()
 
-    -- ── Grapple watcher ──────────────────────────────────
-    if UI.GetValue("grapple_correction") then
+    -- ── Grapple watcher (throttled) ──────────────────────
+    if UI.GetValue("grapple_correction") and (now - _diffLastRun >= DIFF_RATE) then
+        _diffLastRun = now
+
         local localChar = localPlayer.Character
         if localChar then
             if localChar ~= localChar_last then
@@ -1654,6 +1667,7 @@ RunService.Heartbeat:Connect(function()
                 diffAndDetect(localChar, localSnapshot, "LOCAL")
             end
         end
+
         if now - lastNearestCheck >= NEAREST_INTERVAL then
             lastNearestCheck = now
             local newNearest, newChar = getNearestChar()
@@ -1662,6 +1676,7 @@ RunService.Heartbeat:Connect(function()
                 nearestSnapshot = (newNearest and newChar) and buildSnapshot(newChar) or {}
             end
         end
+
         if lastNearestChar and lastNearestPlayer then
             local ok, parent = pcall(function() return lastNearestChar.Parent end)
             if ok and parent then diffAndDetect(lastNearestChar, nearestSnapshot, "NEAREST")
@@ -1673,17 +1688,17 @@ RunService.Heartbeat:Connect(function()
     for i = #notifications, 1, -1 do
         local notif = notifications[i]
         if notif.removing then continue end
-        if tick() - notif.createdAt >= notif.duration and not notif.tweening then
+        if now - notif.createdAt >= notif.duration and not notif.tweening then
             table.remove(notifications, i)
             removeNotification(notif, function() repositionNotifications() end)
         end
     end
--- ── Illusionist Detector ───────────────────────────
+
+    -- ── Illusionist Detector ──────────────────────────────
     if UI.GetValue("illusionist_detector") then
         for _, player in ipairs(Players:GetPlayers()) do
             local pid = safeRead(function() return player.UserId end)
             if pid and pid ~= localPlayer.UserId and not illusionistList[pid] then
-                -- mark as pending so we don't spawn twice
                 illusionistList[pid] = { name = safeRead(function() return player.Name end) or "?", alerted = false, pending = true }
                 watchIllusionist(player)
             end
@@ -1719,7 +1734,6 @@ RunService.Heartbeat:Connect(function()
             pcall(updateSpawnLabels)
         end
     end
-
 end)
 
 print("[Rogue Lineage] v3 Loaded - UI tab active (" .. _VERSION .. ")")
